@@ -95,7 +95,9 @@
    (let [state {:status :loading
                 :session session
                 :session-logs {:status :loading}}
-         event-stream (if (= "exec" (:verb session)) "?event_stream=base64" "")]
+         event-stream (if (= "exec" (:verb session))
+                        "?event_stream=base64"
+                        "")]
      {:db (assoc db :audit->session-details state)
       :fx [[:dispatch [:fetch
                        {:method "GET"
@@ -109,7 +111,11 @@
  (fn
    [{:keys [db]} [_ session]]
    (let [event-size (:event_size session)
-         event-stream (if (= "exec" (:verb session)) "event_stream=base64" "")]
+         event-stream (if (= "exec" (:verb session))
+                        "event_stream=base64"
+                        (if (= "postgres" (:connection_subtype session))
+                          "event_stream=raw-queries"
+                          ""))]
      (if (and event-size (> event-size size-threshold))
        {:db (assoc db
                    :audit->session-details
@@ -149,9 +155,11 @@
  :audit->clear-session
  (fn
    [{:keys [db]} [_]]
-   {:db (assoc db :audit->session-details {:status :loading
-                                           :session nil
-                                           :session-logs {:status :loading}})}))
+   {:db (-> db
+            (assoc :audit->session-details {:status :loading
+                                            :session nil
+                                            :session-logs {:status :loading}})
+            (assoc :audit->session-logs {:status :idle :data nil}))}))
 
 (rf/reg-event-fx
  :audit->get-next-sessions-page
@@ -174,7 +182,9 @@
                    (let [session-id (:session_id res)]
                      (if (and session-id (> (count session-id) 0))
                        (success res)
-                       (rf/dispatch [:show-snackbar {:text error :level :error}]))))]
+                       (rf/dispatch [:show-snackbar {:text "Failed to execute script"
+                                                     :level :error
+                                                     :details error}]))))]
      {:fx [[:dispatch [:fetch (merge
                                {:method "POST"
                                 :uri (str "/sessions/" (:id session) "/exec")
@@ -309,8 +319,9 @@
                         (rf/dispatch [:audit->get-sessions])
                         (rf/dispatch [:audit->get-session-by-id session]))
                       500))
-                   :on-failure #(rf/dispatch [:show-snackbar {:text %
-                                                              :level :error}])}]]]}))
+                   :on-failure #(rf/dispatch [:show-snackbar {:text "Failed to add review"
+                                                              :level :error
+                                                              :details %}])}]]]}))
 
 (rf/reg-event-fx
  :audit->session-file-generate
@@ -318,7 +329,9 @@
    [{:keys [db]} [_ session-id extension]]
    (let [success (fn [res] (.open js/window (:download_url res)))
          failure (fn [error]
-                   (rf/dispatch [:show-snackbar {:text error :level :error}]))]
+                   (rf/dispatch [:show-snackbar {:text "Failed to generate session file"
+                                                 :level :error
+                                                 :details error}]))]
      {:fx [[:dispatch [:fetch {:method "GET"
                                :uri (str "/sessions/"
                                          session-id
@@ -368,10 +381,40 @@
                                              (reset! killing-status :ready))
                                            (rf/dispatch [:show-snackbar
                                                          {:level :error
-                                                          :text (or (:message error) "Failed to kill session")}]))}]]]}))
+                                                          :text "Failed to kill session"
+                                                          :details error}]))}]]]}))
 
 (rf/reg-fx
  :reset-connecting-status
  (fn [connecting-status]
    (when (and connecting-status (satisfies? IAtom connecting-status))
      (reset! connecting-status :ready))))
+
+(rf/reg-event-fx
+ :audit->get-session-logs-data
+ (fn
+   [{:keys [db]} [_ session-id]]
+   {:db (assoc-in db [:audit->session-logs] {:status :loading :data nil})
+    :fx [[:dispatch [:fetch
+                     {:method "GET"
+                      :uri (str "/sessions/" session-id "?expand=event_stream&event_stream=base64")
+                      :on-success #(rf/dispatch [:audit->set-session-logs-data %])
+                      :on-failure (fn [error]
+                                    (rf/dispatch [:show-snackbar
+                                                  {:text "Failed to load session logs"
+                                                   :level :error
+                                                   :details error}])
+                                    (rf/dispatch [:audit->set-session-logs-error]))}]]]}))
+
+(rf/reg-event-db
+ :audit->set-session-logs-data
+ (fn
+   [db [_ session-data]]
+   (assoc-in db [:audit->session-logs] {:status :success
+                                        :data (:event_stream session-data)})))
+
+(rf/reg-event-db
+ :audit->set-session-logs-error
+ (fn
+   [db [_]]
+   (assoc-in db [:audit->session-logs] {:status :error :data nil})))

@@ -2,6 +2,12 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: hoopgateway
+  {{- if .Values.deploymentAnnotations }}
+  annotations:
+  {{- with .Values.deploymentAnnotations }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}
 spec:
   selector:
     matchLabels:
@@ -13,9 +19,15 @@ spec:
     metadata:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/secret-configs.yaml") . | sha256sum }}
+      {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       labels:
         app: hoopgateway
     spec:
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: hoopgateway
+      {{- end }}
       containers:
       - image: '{{ .Values.image.gw.repository | default "hoophq/hoop" }}:{{ .Values.image.gw.tag | default "latest" }}'
         name: hoopgateway
@@ -42,7 +54,7 @@ spec:
       {{- if .Values.defaultAgent.enabled }}
       - image: '{{ .Values.defaultAgent.imageRepository | default "hoophq/hoopdev" }}:{{ .Values.defaultAgent.imageTag | default "latest" }}'
         name: defaultagent
-        command:
+        args:
         - hoop-default-agent.sh
         imagePullPolicy: {{ .Values.defaultAgent.imagePullPolicy | default "Always" }}
         {{- if $.Values.persistence.enabled }}

@@ -43,11 +43,22 @@
  (fn [db [_ value]]
    (assoc-in db [:connection-setup :network-credentials :remote_url] value)))
 
+(rf/reg-event-db
+ :connection-setup/toggle-network-insecure
+ (fn [db [_ enabled?]]
+   (assoc-in db [:connection-setup :network-credentials :insecure] enabled?)))
+
 ;; Database specific events
 (rf/reg-event-db
  :connection-setup/update-database-credentials
  (fn [db [_ field value]]
    (assoc-in db [:connection-setup :database-credentials field] value)))
+
+;; Metadata-driven specific events
+(rf/reg-event-db
+ :connection-setup/update-metadata-credentials
+ (fn [db [_ field value]]
+   (assoc-in db [:connection-setup :metadata-credentials field] value)))
 
 ;; Configuration toggles
 (rf/reg-event-db
@@ -71,7 +82,7 @@
    (let [current-value (get-in db [:connection-setup :config :database-schema])
          effective-value (if (nil? current-value)
                            true
-                           (not current-value))]
+                           current-value)]
      (assoc-in db [:connection-setup :config :database-schema] (not effective-value)))))
 
 (rf/reg-event-db
@@ -94,6 +105,16 @@
  (fn [db [_ command]]
    (assoc-in db [:connection-setup :command] command)))
 
+(rf/reg-event-db
+ :connection-setup/set-command-args
+ (fn [db [_ args]]
+   (assoc-in db [:connection-setup :command-args] args)))
+
+(rf/reg-event-db
+ :connection-setup/set-command-current-arg
+ (fn [db [_ arg]]
+   (assoc-in db [:connection-setup :command-current-arg] arg)))
+
 ;; Review and Data Masking events
 (rf/reg-event-db
  :connection-setup/set-review-groups
@@ -115,7 +136,10 @@
               (not (empty? current-value)))
        (-> db
            (update-in [:connection-setup :credentials :environment-variables]
-                      #(conj (or % []) {:key current-key :value current-value}))
+                      (fn [value]
+                        (if (seq value)
+                          (conj value {:key current-key :value current-value})
+                          [{:key current-key :value current-value}])))
            (assoc-in [:connection-setup :credentials :current-key] "")
            (assoc-in [:connection-setup :credentials :current-value] ""))
        db))))
@@ -134,6 +158,12 @@
  :connection-setup/update-env-var
  (fn [db [_ index field value]]
    (assoc-in db [:connection-setup :credentials :environment-variables index field] value)))
+
+;; Resource Subtype Override events
+(rf/reg-event-db
+ :connection-setup/set-resource-subtype-override
+ (fn [db [_ value]]
+   (assoc-in db [:connection-setup :resource-subtype-override] value)))
 
 ;; Configuration Files events
 (rf/reg-event-db
@@ -171,20 +201,31 @@
  (fn [db [_ next-step]]
    (assoc-in db [:connection-setup :current-step] (or next-step :resource))))
 
-(rf/reg-event-db
+(rf/reg-event-fx
  :connection-setup/go-back
- (fn [db [_]]
-   (let [current-step (get-in db [:connection-setup :current-step])]
+ (fn [{:keys [db]} [_]]
+   (let [current-step (get-in db [:connection-setup :current-step])
+         from-catalog? (get-in db [:connection-setup :from-catalog?])]
      (case current-step
-       :resource (.back js/history -1)
-       :additional-config (assoc-in db [:connection-setup :current-step] :credentials)
-       :credentials (-> db
-                        (assoc-in [:connection-setup :current-step] :resource)
-                        (assoc-in [:connection-setup :type] nil)
-                        (assoc-in [:connection-setup :subtype] nil))
-       :installation (-> db
-                         (assoc-in [:connection-setup :current-step] :additional-config))
-       (.back js/history -1)))))
+       :resource (if from-catalog?
+                   {:fx [[:dispatch [:navigate :resource-catalog]]]}
+                   (do (.back js/history -1) {}))
+       :additional-config {:db (assoc-in db [:connection-setup :current-step] :credentials)}
+       :credentials (if from-catalog?
+                      ;; Se veio do catálogo, verifica contexto para voltar ao lugar certo
+                      (let [current-path (.. js/window -location -pathname)
+                            is-onboarding? (str/includes? current-path "/onboarding")]
+                        (if is-onboarding?
+                          {:fx [[:dispatch [:navigate :onboarding-setup]]]}
+                          {:fx [[:dispatch [:navigate :resource-catalog]]]}))
+                      ;; Senão, limpa type/subtype e volta para resource
+                      {:db (-> db
+                               (assoc-in [:connection-setup :current-step] :resource)
+                               (assoc-in [:connection-setup :type] nil)
+                               (assoc-in [:connection-setup :subtype] nil))})
+       :installation {:db (assoc-in db [:connection-setup :current-step] :additional-config)}
+       ;; Default: volta uma página na história
+       (do (.back js/history -1) {})))))
 
 (rf/reg-event-db
  :connection-setup/set-agent-id
@@ -221,9 +262,7 @@
 (rf/reg-event-db
  :connection-setup/add-tag
  (fn [db [_ full-key value]]
-   (let [_ (println "full-key" full-key)
-         label (tags-utils/extract-label full-key)
-         _ (println "label" label)]
+   (let [label (tags-utils/extract-label full-key)]
      (if (and full-key
               (not (str/blank? full-key))
               value

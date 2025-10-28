@@ -6,16 +6,19 @@
    [webapp.components.loaders :as loaders]
    [webapp.jira-templates.basic-info :as basic-info]
    [webapp.jira-templates.cmdb-table :as cmdb-table]
+   [webapp.jira-templates.connections-section :as connections-section]
    [webapp.jira-templates.form-header :as form-header]
    [webapp.jira-templates.helpers :as helpers]
    [webapp.jira-templates.mapping-table :as mapping-table]
+   [webapp.jira-templates.preset-mapping-table :as preset-mapping-table]
    [webapp.jira-templates.prompts-table :as prompts-table]
    [webapp.jira-templates.workflow-info :as workflow-info]))
 
 (defn jira-form [form-type template scroll-pos]
   (let [state (helpers/create-form-state template)
         handlers (helpers/create-form-handlers state)
-        submitting? (rf/subscribe [:jira-templates->submitting?])]
+        submitting? (rf/subscribe [:jira-templates->submitting?])
+        all-connections (rf/subscribe [:connections])]
     (fn []
       [:> Box {:class "min-h-screen bg-gray-1"}
        [:form {:id "jira-form"
@@ -47,6 +50,33 @@
           {:status (:issue_transition_name_on_close state)
            :on-status-change #(reset! (:issue_transition_name_on_close state) %)}]
 
+         ;; Connections section
+         [connections-section/main
+          {:connection-ids (:connection_ids state)
+           :on-connections-change (:on-connections-change handlers)
+           :all-connections (:results @all-connections)}]
+
+         [:> Flex {:direction "column" :gap "5"}
+          [:> Box
+           [:> Flex {:align "center" :gap "2"}
+            [:> Heading {:as "h3" :size "4" :weight "bold" :class "text-[--gray-12]"}
+             "Configure connection tags mapping"]]
+           [:> Text {:size "3" :class "text-[--gray-11]"}
+            "Match key-value information in Jira fields with your connection tags."]]
+
+          [:> Box {:class "space-y-radix-7"}
+           [preset-mapping-table/main
+            (merge
+             {:state (:mapping state)
+              :select-state (:mapping-select-state state)}
+             (select-keys handlers
+                          [:on-mapping-field-change
+                           :on-mapping-select
+                           :on-toggle-mapping-select
+                           :on-toggle-all-mapping
+                           :on-mapping-delete
+                           :on-mapping-add]))]]]
+
          [:> Flex {:direction "column" :gap "5"}
           [:> Box
            [:> Flex {:align "center" :gap "2"}
@@ -67,7 +97,6 @@
                            :on-toggle-all-mapping
                            :on-mapping-delete
                            :on-mapping-add]))]]]
-
 
          [:> Flex {:direction "column" :gap "5"}
           [:> Box
@@ -118,6 +147,8 @@
 (defn main [form-type]
   (let [jira-template (rf/subscribe [:jira-templates->active-template])
         scroll-pos (r/atom 0)]
+
+    (rf/dispatch [:jira-templates->get-connections])
     (fn []
       (r/with-let [handle-scroll #(reset! scroll-pos (.-scrollY js/window))]
         (.addEventListener js/window "scroll" handle-scroll)

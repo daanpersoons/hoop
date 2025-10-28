@@ -1,48 +1,24 @@
 (ns webapp.components.forms
   (:require
-   ["@heroicons/react/24/outline" :as hero-outline-icon]
-   ["@radix-ui/themes" :refer [IconButton Select TextArea TextField]]
-   ["lucide-react" :refer [Eye EyeOff]]
+   ["@radix-ui/themes" :refer [Select Tooltip Text]]
+   ["lucide-react" :refer [Eye EyeOff HelpCircle]]
    [clojure.string :as cs]
    [reagent.core :as r]))
 
 (defn- form-label
   [text]
-  [:label {:class "block text-xs font-semibold text-[--gray-12]"} text])
+  [:> Text {:size "1" :as "label" :weight "bold" :class "text-gray-12"}
+   text])
 
 (defn- form-label-dark
   [text]
-  [:label {:class "text-white block text-xs font-semibold"} text])
+  [:> Text {:size "1" :as "label" :weight "bold" :class "text-gray-12"}
+   text])
 
 (defn- form-helper-text
-  [text dark]
-  [:div {:class (str "relative flex flex-col group"
-                     (when dark " text-white"))}
-   [:> hero-outline-icon/QuestionMarkCircleIcon {:class "w-4 h-4"
-                                                 :aria-hidden "true"}]
-   [:div {:class "absolute bottom-0 flex-col hidden mb-6 w-max group-hover:flex"}
-    [:span {:class (str "relative border -left-3 border-gray-300 bg-white rounded-md z-50 "
-                        "p-2 text-xs text-gray-700 leading-none whitespace-no-wrap shadow-lg")}
-     text]
-    [:div {:class "w-3 h-3 -mt-2 border-r border-b border-gray-300 bg-white transform rotate-45"}]]])
-
-(defonce common-styles
-  "relative block w-full
-   py-3 px-2
-   border border-gray-300 rounded-md
-   focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm disabled:opacity-50")
-
-(defonce common-styles-dark
-  "relative block w-full bg-transparent
-   py-3 px-2 text-white
-   border border-gray-400 rounded-md
-   focus:ring-white focus:border-white sm:text-sm disabled:opacity-50")
-
-(defonce input-styles
-  (str common-styles " h-12"))
-
-(defonce input-styles-dark
-  (str common-styles-dark " h-12"))
+  [text]
+  [:> Tooltip {:content text}
+   [:> HelpCircle {:size 14}]])
 
 (defn input
   "Multi purpose HTML input component.
@@ -132,22 +108,6 @@
               [:> Eye {:size 16}]
               [:> EyeOff {:size 16}])]])]])))
 
-(defn input-metadata [{:keys [label name id placeholder disabled required value on-change]}]
-  [:div {:class "relative"}
-   [:label {:htmlFor label
-            :class "absolute -top-2 left-2 inline-block bg-white px-1 text-xs font-medium text-gray-900"}
-    label]
-   [:div {:class "rt-TextFieldRoot rt-r-size-1 rt-variant-surface dark"}
-    [:input {:type "text"
-             :name name
-             :id id
-             :class "rt-reset rt-TextFieldInput"
-             :placeholder placeholder
-             :disabled (or disabled false)
-             :required (or required false)
-             :on-change on-change
-             :value value}]]])
-
 (defn textarea
   [{:keys [label
            placeholder
@@ -178,7 +138,7 @@
                         "3" "rt-r-size-3"
                         "2" "rt-r-size-2"
                         "1" "rt-r-size-1"
-                        "rt-r-size-2"))}
+                        "rt-r-size-3"))}
     [:textarea
      {:class (str "rt-reset rt-TextAreaInput "
                   (when dark "dark"))
@@ -231,13 +191,16 @@
       [form-label label])
     (when (not (cs/blank? helper-text))
       [form-helper-text helper-text dark])]
-   [:> Select.Root {:size (or size "3")
-                    :name name
-                    :value selected
-                    :default-value default-value
-                    :on-value-change on-change
-                    :required (or required false)
-                    :disabled (or disabled false)}
+   [:> Select.Root (merge
+                    (when-not (cs/blank? default-value)
+                      {:default-value default-value})
+                    (when-not (cs/blank? selected)
+                      {:value selected})
+                    {:size (or size "3")
+                     :name name
+                     :on-value-change on-change
+                     :required (or required false)
+                     :disabled (or disabled false)})
     [:> Select.Trigger {:placeholder (or placeholder "Select one")
                         :variant (or variant "surface")
                         :color "indigo"
@@ -245,26 +208,4 @@
                                     (when dark "dark"))}]
     [:> Select.Content {:position "popper"
                         :color "indigo"}
-     (map #(option % selected) options)]]])
-
-(defn select-editor
-  "HTML select.
-  Props signature:
-  label -> html label text;
-  options -> List of {:text string :value string};
-  active -> the option value of an already active item;
-  on-change -> function to be executed on change;
-  required -> HTML required attribute;"
-  [{:keys [name size options selected on-change full-width? required disabled]}]
-  [:div {:class "text-xs"}
-   [:> Select.Root {:size (or size "1")
-                    :name name
-                    :value selected
-                    :on-value-change on-change
-                    :required (or required false)
-                    :disabled (or disabled false)}
-    [:> Select.Trigger {:class (str "dark"
-                                    (when full-width? "w-full"))
-                        :placeholder "Select one"}]
-    [:> Select.Content {:position "popper"}
      (map #(option % selected) options)]]])

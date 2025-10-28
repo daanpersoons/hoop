@@ -26,7 +26,10 @@
   (let [organization-name (r/atom "")
         user-name (r/atom "")
         userinfo (rf/subscribe [:users->current-user])]
-    (rf/dispatch [:users->get-user])
+
+    (when (empty? (:data @userinfo))
+      (rf/dispatch [:users->get-user]))
+
     (fn []
       (let [login-error (.getItem js/localStorage "login_error")
             current-user (:data @userinfo)]
@@ -40,7 +43,6 @@
                            (.preventDefault e)
                            (reset! loading (not @loading))
                            (rf/dispatch [:segment->track "SignUp - Create organization"])
-                           (rf/dispatch [:segment->identify (:data @userinfo)])
                            (rf/dispatch [:auth->signup @organization-name @user-name]))}
              (when login-error
                [:div {:class "pb-small"}

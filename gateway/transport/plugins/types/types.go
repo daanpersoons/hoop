@@ -48,6 +48,7 @@ type Context struct {
 	ConnectionSecret                    map[string]any
 	ConnectionTags                      map[string]string
 	ConnectionJiraTransitionNameOnClose string
+	ConnectionReviewers                 []string
 
 	// Agent attributes
 	AgentID   string
@@ -62,12 +63,21 @@ type Context struct {
 	ClientOrigin string
 
 	ParamsData GenericMap
+
+	// hook to cleanup the transport extensions package handlers
+	ExtensionsOnDisconnectFn func(sid string)
+}
+
+type PluginResource interface {
+	GetName() string
+	GetOrgID() string
+	GetEnvVars() map[string]string
 }
 
 type Plugin interface {
 	Name() string
 	OnStartup(pctx Context) error
-	OnUpdate(oldState, newState *types.Plugin) error
+	OnUpdate(oldState, newState PluginResource) error
 	OnConnect(pctx Context) error
 	OnReceive(pctx Context, pkt *pb.Packet) (*ConnectResponse, error)
 	OnDisconnect(pctx Context, errMsg error) error
@@ -97,6 +107,10 @@ func (c *Context) Validate() error {
 		return fmt.Errorf("missing required context attributes")
 	}
 	return nil
+}
+
+func (c Context) ProtoConnectionType() pb.ConnectionType {
+	return pb.ToConnectionType(c.ConnectionType, c.ConnectionSubType)
 }
 
 func (m GenericMap) Get(key string) any { return m[key] }

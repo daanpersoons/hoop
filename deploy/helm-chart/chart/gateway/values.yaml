@@ -2,7 +2,7 @@
 ## This is a YAML-formatted file.
 ## Declare variables to be passed into your templates.
 
-# Refer to this guide for more details: https://hoop.dev/docs/self-hosting/kubernetes
+# Refer to this guide for more details: https://hoop.dev/docs/setup/deployment/overview
 
 # -- Define a custom image configuration
 image:
@@ -17,12 +17,58 @@ defaultAgent:
   imageRepository: 'hoophq/hoopdev'
   imageTag: latest
   imagePullPolicy: Always
+  grpcHost: 127.0.0.1:8010
+
+
+# -- Enable PostgreSQL
+postgres:
+  # it default to host mount when enabled
+  enabled: false
+
+  # set a storage class name to use a Persistent Volume Claim
+  storageClassName: null
+
+  # -- Size of PVC
+  size: 10Gi
+  # annotations: {}
+
+# -- Enable data masking with Presidio
+dataMasking:
+  enabled: false
+  version: latest
+  # best-effort | strict
+  mode: best-effort
+
+  analyzer:
+    resources:
+      limits:
+        cpu: 512m
+        memory: 1024Mi
+      requests:
+        cpu: 256m
+        memory: 1024Mi
+
+  anonymizer:
+    resources:
+      limits:
+        cpu: 512m
+        memory: 512Mi
+      requests:
+        cpu: 256m
+        memory: 512Mi
+
+## Set pod annotations
+##
+podAnnotations: {}
+
+## Set deployment annotations
+##
+deploymentAnnotations: {}
 
 # hoop gateway configuration. Please refer to https://hoop.dev/docs/self-hosting
 config:
   POSTGRES_DB_URI: ''
   # API_URL: 'yourdomain.tld'
-  JWT_SECRET_KEY: null
   IDP_AUDIENCE: null
   IDP_ISSUER: null
   IDP_CLIENT_ID: null
@@ -35,9 +81,20 @@ config:
   # GOOGLE_APPLICATION_CREDENTIALS_JSON: ''
   # PLUGIN_AUDIT_PATH: ''
   # PLUGIN_INDEX_PATH: ''
-  notification: {}
-  #   slackBotToken: ''
-  #   bridgeUrl: ''
+
+mainService:
+  # -- Annotations to add in the main service
+  annotations: {}
+    # beta.cloud.google.com/backend-config: '{"ports": {"http": "hoopgateway-http", "grpc": "hoopgateway-grpc"}}'
+    # cloud.google.com/app-protocols: '{"http":"HTTPS", "grpc":"HTTP2"}'
+  # -- GCP BackendConfig resource
+  httpBackendConfig: {}
+    # healthCheckType: HTTPS
+    # timeoutSec: 30
+  # -- GCP BackendConfig resource
+  grpcBackendConfig: {}
+    # healthCheckType: HTTPS
+    # timeoutSec: 259200
 
 ingressApi:
   # -- Enables Ingress
@@ -104,3 +161,9 @@ resources:
     requests:
       cpu: 512m
       memory: 1Gi
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: false
+  # Annotations to add to the service account
+  annotations: {}

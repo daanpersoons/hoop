@@ -1,121 +1,155 @@
+
 ![hero](github.png)
 
-<h1 align="center"><b>hoop.dev</b></h1>
-<p align="center">
-    🔒 Secure, seamless access to databases and servers. No compromises.
-    <br />
-    <br />
-    <a target="_blank" href="https://hoop.dev">Website</a>
-    ·
-    <a target="_blank" href="https://hoop.dev/docs">Docs</a>
-    ·
-    <a href="https://github.com/hoophq/hoop/discussions">Discussions</a>
-  </p>
-</p>
+<h1 align="center">
+<b>hoop.dev</b>
+</h1>
+<p align="center"> 🔒 Access any database or server. Customer data automatically hidden. Everything recorded.
+  
+<br /> <br />
+ <a target="_blank" href="https://hoop.dev">Website</a> · <a target="_blank" href="https://hoop.dev/docs">Docs</a> · <a href="https://github.com/hoophq/hoop/discussions">Discussions</a> </p> </p>
+ <p align="center"><a href="https://github.com/hoophq/hoop/actions/workflows/release.yml"><img src="https://img.shields.io/github/v/release/hoophq/hoop.svg?style=flat" /> </a><img src="https://img.shields.io/badge/Setup-4.3_min-success" /></p>
 
+The only access proxy that blocks dangerous linux commands and scrubs sensitive database outputs
 
-<p align="center">
-    <a href="https://github.com/hoophq/hoop/actions/workflows/release.yml">
-        <img src="https://img.shields.io/github/v/release/hoophq/hoop.svg?style=flat" />
-    </a>
-    <a href="https://github.com/hoophq/hoop/actions/workflows/release.yml">
-        <img src="https://github.com/hoophq/hoop/actions/workflows/release.yml/badge.svg" />
-    </a>
-</p>
+## Without Hoop
 
-## Features
+```sql
+-- Debugging production issue...
+SELECT * FROM users WHERE id = 42;
+┌────┬─────────────────────────┬─────────────┬─────────────────┬────────────────────┐
+│ id │ email                   │ ssn         │ phone           │ credit_card        │
+├────┼─────────────────────────┼─────────────┼─────────────────┼────────────────────┤
+│ 42 │ john.doe@example.com    │ 123-45-6789 │ (555) 123-4567  │ 4111-1111-1111-1111 │
+└────┴─────────────────────────┴─────────────┴─────────────────┴────────────────────┘
+-- You screenshot the result for Slack...
+-- 💀 SSNs, credit cards, and phone numbers now in your team chat
+```
 
-- 🔐 **Zero Trust Access**: Connect securely without VPNs or exposed credentials
-- 🛡️ **Real-time Data Masking**: Automatically hide sensitive data in transit
-- 🛠 **Granular Access Control**: Just-in-Time, least-privilege access to resources
-- 🌐 **Audit Logging**: Comprehensive logs of all actions and queries
-- 🤖 **ChatOps Integration**: Approve access requests via Slack or MS Teams
-- ☁️ **Multi-Cloud Support**: Works with AWS, GCP, Azure, and on-premises setups
+One query, one screenshot, one data breach.
 
-## 🌟 Why Hoop?
+## With Hoop
 
-- **Simplified Access Management**: No more VPN or SSH key nightmares
-- **Enhanced Security**: Reduce attack surface and prevent credential leaks
-- **Compliance Made Easy**: Meet SOC2, HIPAA, and GDPR requirements out of the box
-- **Developer Productivity**: Faster, safer access to the resources devs need
+Same query through Hoop:
 
-<!--
-## 🚀 Quick Start
+```sql
+-- You see:
+┌────┬──────────────────┬─────────────┬──────────────────┬─────────────────┐
+│ id │ email            │ ssn         │ phone            │ credit_card     │
+├────┼──────────────────┼─────────────┼──────────────────┼─────────────────┤
+│ 42 │ **************** │ *********** │ ************     │ *************** │
+└────┴──────────────────┴─────────────┴──────────────────┴─────────────────┘
 
-Get up and running in minutes:
+-- Now it's safe to share
+```
+
+## Without Hoop
+```sql
+-- Fixing bug at 3AM...
+UPDATE users SET name = 'Bob Ross'
+
+-- 💀 1000000 rows updated
+
+```
+
+## With Hoop
+```sql
+-- Fixing bug at 3AM...
+UPDATE users SET name = 'Bob Ross'
+
+-- 🚫 Query blocked by Guardrail: "Prevent UPDATE without WHERE
+
+```
+
+**That's it.** Hoop sits between you and your infrastructure. Sensitive data gets masked automatically. Dangerous operations blocked. Everything gets recorded.
+
+## 30-Second Demo
 
 ```bash
 # create a jwt secret for auth
 echo "JWT_SECRET_KEY=$(openssl rand -hex 32)" >> .env
 
 # download and run
-curl -sL https://hoop.dev/docker-compose.yml > docker-compose.yml | docker compose -f - up
+curl -sL https://hoop.dev/docker-compose.yml > docker-compose.yml
+docker compose up
+```
+
+[View full installation options](https://hoop.dev/docs/setup/deployment/overview)
+
+## How It Works
 
 ```
-[View full installation options](#installation)
--->
+You → Hoop → Your Infrastructure
+       ↓
+   • Masks sensitive data (ML-powered)
+   • Blocks dangerous commands
+   • Records everything (for compliance)  
+   • Controls access (who, what, when)
+```
+
+Works with:
+- **Databases**: PostgreSQL, MySQL, MongoDB, Redis
+- **Servers**: SSH, Kubernetes, Docker
+- **Tools**: HTTP APIs, internal services
+
+## Why Teams Love Hoop
+
+### 🧠 Smart Masking
+Not regex. Machine learning that understands context.
+- Knows "555-1234" is a phone number in user data
+- Knows "BUILD-555-1234" is a build number
+- Works in any language
+
+### ⚡ Actually Fast
+- <5ms latency
+- No performance impact
+- Works with existing tools
+
+### 🔐 Real Security
+- Nothing to configure
+- Full audit trail
+- SOC2/HIPAA/GDPR compliant
+
 ## 📚 Popular Guides
 
-- [Secure MySQL Access](https://hoop.dev/docs/quickstarts/mysql)
-- [Kubernetes Integration](https://hoop.dev/docs/quickstarts/kubernetes)
-- [AI-Powered Data Masking](https://hoop.dev/docs/learn/ai-data-masking)
-- [Implement Just-in-Time Reviews](https://hoop.dev/docs/learn/jit-reviews)
+### Databases
 
-[Explore all guides](#guides)
+-   [MySQL](https://hoop.dev/docs/quickstart/databases/mysql)
+-   [PostgreSQL](https://hoop.dev/docs/quickstart/databases/postgres)
+-   [MongoDB](https://hoop.dev/docs/quickstart/databases/mongodb)
+-   [MSSQL](https://hoop.dev/docs/quickstart/databases/mssql)
 
-## 🌟 Key Features
+### Cloud & Infrastructure
 
-- [AI Data Masking](https://hoop.dev/docs/learn/ai-data-masking)
-- [Granular Access Control](https://hoop.dev/docs/learn/access-control)
-- [Just-in-Time Reviews](https://hoop.dev/docs/learn/jit-reviews)
-- [Automated Runbooks](https://hoop.dev/docs/learn/runbooks)
-- [Secrets Manager Integration](https://hoop.dev/docs/learn/secrets-manager)
-- [Comprehensive Session Recording](https://hoop.dev/docs/learn/session-recording)
-- [Webhooks/SIEM Support](https://hoop.dev/docs/learn/webhooks-siem)
-- [AI Query Builder](https://hoop.dev/docs/learn/ai-query-builder)
+-   [Kubernetes](https://hoop.dev/docs/quickstart/cloud-services/kubernetes)
+-   [AWS](https://hoop.dev/docs/quickstart/cloud-services/aws/aws-cli)
+-   [SSH Jump Hosts](https://hoop.dev/docs/quickstart/web-applications/jump-hosts)
 
-[Explore features](#features)
-
-
-## About hoop.dev
-
-Hoop.dev is an access gateway for databases and servers with an API for packet manipulation. Because of the modern architecture powering Hoop, the open-source version includes advanced features like:
-
- * **Passwordless Auth, No Certificates**: older gateways require high-maintenance certificate authorities. Hoop uses OIDC and Oauth2 for authentication, letting your IDP handle everything behind the scenes. Forget about certificates!
- * **Open-source SSO**: support for Okta, Keycloak, Jumpcloud, and others. There is no need for Enterprise versions to integrate your own IDP. You're not limited to GitHub sign-in.
- * **Session recording**: Linux, Docker, Kubernetes, Mysql, Postgres, MongoDB, and many more.
- * **Just-in-time access**: grant time-bound sessions using groups synced from your IDP.
- * **Slack and Teams Access Requests**: Chatbot approval workflows can be done without leaving your chat app.
-
-Discover the unique capabilities that only Hoop can offer. From packet manipulation to web and proxy modes, Hoop is designed to meet your diverse needs.
-
-* **Manipulate packets**: Programmatically changes the gateway's environment and each connection's packets in real-time. Check out the [Secrets Manager integration example](https://hoop.dev/docs/learn/secrets-manager).
- * **Web and proxy modes**: Existing gateways lock you into either a web client interface or a proxy that requires desktop agents. Hoop gives you both options.
- * **Custom connections**: bring your own CLI or hide complex options from developers.
-
-See the full list of features for the free open-source and the enterprise versions on [hoop.dev/features](https://hoop.dev/features).
+[View all guides](https://hoop.dev/docs/quickstart)
 
 ## Installation
 
 ### Docker
 
-[See Docker Compose installation documentation](https://hoop.dev/docs/getting-started/installation/docker-compose)
-<!--
+bash
+
 ```bash
 # create a jwt secret for auth
 echo "JWT_SECRET_KEY=$(openssl rand -hex 32)" >> .env
 
 # download and run
-curl -sL https://hoop.dev/docker-compose.yml > docker-compose.yml | docker compose -f - up
+curl  -sL https://hoop.dev/docker-compose.yml > docker-compose.yml &&  docker compose up
+```
 
--->
+[See Docker Compose installation documentation](https://hoop.dev/docs/setup/deployment/docker-compose)
+
 ### Kubernetes
 
-[See Kubernetes Deployment Documentation](https://hoop.dev/docs/deploy/kubernetes)
+[See Kubernetes Deployment Documentation](https://hoop.dev/docs/setup/deployment/kubernetes)
 
 ### AWS
 
- [See AWS Deploy & Host Documentation](https://hoop.dev/docs/deploy/AWS)
+[See AWS Deploy & Host Documentation](https://hoop.dev/docs/setup/deployment/AWS)
 
 | Region | Launch Stack |
 |--------|--------------|
@@ -128,55 +162,24 @@ curl -sL https://hoop.dev/docker-compose.yml > docker-compose.yml | docker compo
 | Frankfurt (eu-central-1) | [![Launch Stack](https://cdn.rawgit.com/buildkite/cloudformation-launch-stack-button-svg/master/launch-stack.svg)](https://eu-central-1.console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?templateURL=https%3A%2F%2Fhoopdev-platform-cf-eu-central-1.s3.eu-central-1.amazonaws.com%2Flatest%2Fhoopdev-platform.template.yaml) |
 | Sydney (ap-southeast-2) | [![Launch Stack](https://cdn.rawgit.com/buildkite/cloudformation-launch-stack-button-svg/master/launch-stack.svg)](https://ap-southeast-2.console.aws.amazon.com/cloudformation/home?region=ap-southeast-2#/stacks/quickcreate?templateURL=https%3A%2F%2Fhoopdev-platform-cf-ap-southeast-2.s3.ap-southeast-2.amazonaws.com%2Flatest%2Fhoopdev-platform.template.yaml) |
 
-<!--
-## 🚀 Quick Start
+[View all regions](https://hoop.dev/docs/deploy/AWS)
 
-Get up and running in minutes:
+## Advanced Features
 
-```bash
-curl -sL https://hoop.dev/install.sh | sh
-```
+What makes Hoop unique is its ability to not only inspect but also modify connections between users and infrastructure:
 
-[View full installation options](#installation)
--->
-## Guides
+-   [**AI Data Masking**](https://hoop.dev/docs/learn/features/ai-data-masking)  - Automatically hide sensitive data like emails, SSNs, and credit cards
+-   [**Just-in-Time Reviews**](https://hoop.dev/docs/learn/features/reviews/overview)  - Approve risky commands in real-time through Slack or MS Teams
+-   [**Runbooks**](https://hoop.dev/docs/learn/features/runbooks)  - Create pre-approved workflows for common tasks
+-   [**Web & Native Modes**](https://hoop.dev/docs/clients)  - Use the web interface or connect through your native database tools
 
-### Databases
-- [MySQL](https://hoop.dev/docs/quickstarts/mysql)
-- [PostgreSQL](https://hoop.dev/docs/quickstarts/postgres)
-- [MongoDB](https://hoop.dev/docs/quickstarts/mongodb)
-- [MSSQL](https://hoop.dev/docs/quickstarts/mssql)
-- [Oracle](https://hoop.dev/docs/quickstarts/oracle)
-- [Apache Cassandra](https://hoop.dev/docs/quickstarts/apache-cassandra)
+[See all features](https://hoop.dev/docs/learn/features)
 
-### Cloud & Infrastructure
-- [Kubernetes](https://hoop.dev/docs/quickstarts/kubernetes)
-- [AWS](https://hoop.dev/docs/quickstarts/aws)
-- [SSH Jump Hosts](https://hoop.dev/docs/quickstarts/ssh-jump-hosts)
+## You'll be in Good Company
 
-### Application Consoles
-- [Ruby on Rails Console](https://hoop.dev/docs/quickstarts/ruby-on-rails)
-- [Elixir IEx](https://hoop.dev/docs/quickstarts/elixir-IEx)
-- [PHP Artisan](https://hoop.dev/docs/quickstarts/php-artisan)
-- [Python Environments](https://hoop.dev/docs/quickstarts/python)
-
-### Web & APIs
-- [Web Apps & APIs](https://hoop.dev/docs/quickstarts/webapps-and-apis)
-
-[Explore all guides](https://hoop.dev/docs/quickstarts)
-
-## Features
-
-- [AI Data Masking](https://hoop.dev/docs/learn/ai-data-masking)
-- [Access Control](https://hoop.dev/docs/learn/access-control)
-- [Just-in-Time Reviews](https://hoop.dev/docs/learn/jit-reviews)
-- [Runbooks](https://hoop.dev/docs/learn/runbooks)
-- [Secrets Manager](https://hoop.dev/docs/learn/secrets-manager)
-- [Session Recording](https://hoop.dev/docs/learn/session-recording)
-- [Webhooks/SIEM](https://hoop.dev/docs/learn/webhooks-siem)
-- [AI Query Builder](https://hoop.dev/docs/learn/ai-query-builder)
-
-[See all features](https://hoop.dev/features)
+-   **200+ successful deployments**  from companies around the world
+-   **4.3 minute average setup time**  across all deployments
+-   **Trusted by teams**  from startups to enterprises
 
 ## 🤝 Contributing
 
@@ -185,6 +188,8 @@ We welcome contributions! Check out our [Development Documentation](/DEV.md) to 
 ## 📣 Community
 
 Join our [Discussions](https://github.com/hoophq/hoop/discussions) to ask questions, share ideas, and connect with other users.
+
+⭐ Star this if you've ever worried about screenshots in Slack
 
 ## Backed by
 

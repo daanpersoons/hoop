@@ -34,10 +34,9 @@ type (
 )
 
 const (
-	StatusActive    StatusType = "active"
-	StatusInactive  StatusType = "inactive"
-	StatusReviewing StatusType = "reviewing"
-	StatusInvited   StatusType = "invited"
+	StatusActive   StatusType = "active"
+	StatusInactive StatusType = "inactive"
+	StatusInvited  StatusType = "invited"
 
 	// RoleAdminType will grant access to all routes.
 	RoleAdminType RoleType = "admin"
@@ -72,13 +71,18 @@ type User struct {
 	// The profile picture url to display
 	Picture string `json:"picture" example:""`
 	// Groups registered for this user
-	Groups []string `json:"groups" example:"sre"`
+	Groups []string `json:"groups" example:"sre,dba"`
 	// Local auth cases have a password
-	Password string `json:"password" example:"password"`
+	Password string `json:"password,omitempty" example:"mysecurepassword"`
 }
 
 type UserPatchSlackID struct {
 	SlackID string `json:"slack_id" binding:"required" example:"U053ELZHB53"`
+}
+
+type UserGroup struct {
+	// Name of the user group
+	Name string `json:"name" binding:"required" example:"engineering"`
 }
 
 type UserInfo struct {
@@ -123,11 +127,11 @@ type ServiceAccount struct {
 	OrgID string `json:"org_id" readonly:"true" format:"uuid"`
 	// Subject is the external identifier that maps the user from the identity provider.
 	// This field is immutable after creation
-	Subject string `json:"subject" example:"bJ8xV3ASWGTi7L9Z6zvHKqxJlnZM5TxV1bRdc0706vW"`
+	Subject string `json:"subject" binding:"required" example:"bJ8xV3ASWGTi7L9Z6zvHKqxJlnZM5TxV1bRdc0706vW"`
 	// The display name of this service account
 	Name string `json:"name" example:"system-automation"`
 	// Inactive service account will not be able to access the api
-	Status ServiceAccountStatusType `json:"status" binding:"required"`
+	Status ServiceAccountStatusType `json:"status" binding:"required" enums:"active,inactive"`
 	// The groups in which this service account belongs to
 	Groups []string `json:"groups" example:"engineering"`
 }
@@ -187,6 +191,8 @@ type Connection struct {
 	// Is the shell command that is going to be executed when interacting with this connection.
 	// This value is required if the connection is going to be used from the Webapp.
 	Command []string `json:"command" example:"/bin/bash"`
+	// Resource to which this connection belongs to, it'll be created if it doesn't exist
+	ResourceName string `json:"resource_name" example:"pgdemo"`
 	// Type represents the main type of the connection:
 	// * database - Database protocols
 	// * application - Custom applications
@@ -197,7 +203,12 @@ type Connection struct {
 	// * mysql - Implements MySQL protocol
 	// * mongodb - Implements MongoDB Wire Protocol
 	// * mssql - Implements Microsoft SQL Server Protocol
+	// * oracledb - Implements Oracle Database Protocol
 	// * tcp - Forwards a TCP connection
+	// * ssh - Forwards a SSH connection
+	// * httpproxy - Forwards a HTTP connection
+	// * dynamodb - AWS DynamoDB experimental integration
+	// * cloudwatch - AWS CloudWatch experimental integration
 	SubType string `json:"subtype" example:"postgres"`
 	// Secrets are environment variables that are going to be exposed
 	// in the runtime of the connection:
@@ -334,6 +345,8 @@ type RunbookRequest struct {
 	ClientArgs []string `json:"client_args" example:"--verbose"`
 	// Metadata attributes to add in the session
 	Metadata map[string]any `json:"metadata"`
+	// Jira fields to create a Jira issue
+	JiraFields map[string]string `json:"jira_fields"`
 }
 
 type RunbookList struct {
@@ -392,6 +405,14 @@ type (
 	SessionOptionKey                     string
 )
 
+type SessionEventStreamType string
+
+const (
+	SessionEventStreamUTF8Type       SessionEventStreamType = "utf8"
+	SessionEventStreamBase64Type     SessionEventStreamType = "base64"
+	SessionEventStreamRawQueriesType SessionEventStreamType = "raw-queries"
+)
+
 type SessionGetByIDParams struct {
 	// The file extension to donwload the session as a file content.
 	// * `csv` - it will parse the content to format in csv format
@@ -407,8 +428,11 @@ type SessionGetByIDParams struct {
 	NewLine string `json:"new_line" enums:"0,1" example:"1" default:"0"`
 	// Construct the file content adding the event time as prefix when parsing each event
 	EventTime string `json:"event-time" enums:"0,1" example:"1" default:"0"`
-	// This option will parse the session output (o) and error (e) events as an utf-8 content in the session payload
-	EventStream string `json:"event_stream" enums:"utf8,base64" default:""`
+	// Parse available options for the event stream
+	// * `utf8` - parse the session output (o) and error (e) events as utf-8 content in the session payload
+	// * `base64` - parse the session output (o) and error (e) events as base64 content in the session payload
+	// * `raw-queries` - encode each event stream parsing the input of queries based on the database wire protocol (available databases: postgres)
+	EventStream SessionEventStreamType `json:"event_stream" default:""`
 	// Expand the given attributes
 	Expand string `json:"expand" enums:"event_stream" example:"event_stream" default:""`
 }
@@ -499,7 +523,9 @@ type Session struct {
 	// * `<event-type>` - the event type as string (i: input, o: output e: output-error)
 	// * `<base64-content>` - the content of the session encoded as base64 string
 	EventStream json.RawMessage `json:"event_stream,omitempty" swagger:"type:string"`
-	// The stored resource size in bytes
+	// The stored resource size in bytes.
+	// When any parsing is applied to the request the value display the computed parsed size.
+	// The pre-computed size will be available in the attribute `metrics.event_size`
 	EventSize int64 `json:"event_size" example:"569"`
 	// When the execution started
 	StartSession time.Time `json:"start_date" example:"2024-07-25T15:56:35.317601Z"`
@@ -608,20 +634,12 @@ type SessionReview struct {
 type Review struct {
 	// Resource identifier
 	ID string `json:"id" format:"uuid" readonly:"true" example:"9F9745B4-C77B-4D52-84D3-E24F67E3623C"`
-	// Organization identifier
-	OrgId string `json:"org" format:"uuid" readonly:"true" example:"A72CF2A0-12D0-4E0D-A732-E34FFA3D9417"`
-	// The time the resource was created
-	CreatedAt time.Time `json:"created_at" readonly:"true" example:"2024-07-25T15:56:35.317601Z"`
+	// The id of session
+	Session string `json:"session" format:"uuid" readonly:"true" example:"35DB0A2F-E5CE-4AD8-A308-55C3108956E5"`
 	// The type of the review
 	// * onetime - Represents a one time execution
 	// * jit - Represents a time based review
 	Type ReviewType `json:"type" enums:"onetime,jit" readonly:"true"`
-	// The id of session
-	Session string `json:"session" format:"uuid" readonly:"true" example:"35DB0A2F-E5CE-4AD8-A308-55C3108956E5"`
-	// The input that was issued when the resource was created
-	Input string `json:"input" readonly:"true" example:"SELECT NOW()"`
-	// The client arguments when the resource was created
-	InputClientArgs []string `json:"input_clientargs" readonly:"true" example:"-x"`
 	// The amount of time (nanoseconds) to allow access to the connection. It's valid only for `jit` type reviews
 	AccessDuration time.Duration `json:"access_duration" swaggertype:"integer" readonly:"true" default:"1800000000000" example:"0"`
 	// The status of the review
@@ -635,10 +653,8 @@ type Review struct {
 	Status ReviewStatusType `json:"status"`
 	// The time when this review was revoked
 	RevokeAt *time.Time `json:"revoke_at" readonly:"true" example:""`
-	// Contains information about the owner of this resource
-	ReviewOwner ReviewOwner `json:"review_owner" readonly:"true"`
-	// The review connection information
-	Connection ReviewConnection `json:"review_connection" readonly:"true"`
+	// The time the resource was created
+	CreatedAt time.Time `json:"created_at" readonly:"true" example:"2024-07-25T15:56:35.317601Z"`
 	// Contains the groups that requires to approve this review
 	ReviewGroupsData []ReviewGroup `json:"review_groups_data" readonly:"true"`
 }
@@ -691,7 +707,7 @@ type Plugin struct {
 	// * webhooks - Send events via webhooks
 	Name string `json:"name" binding:"required" enums:"audit,access_control,dlp,indexer,review,runbooks,slack,webhooks" example:"slack"`
 	// The list of connections configured for a specific plugin
-	Connections []*PluginConnection `json:"connections" binding:"required"`
+	Connections []*PluginResourceConnection `json:"connections" binding:"required"`
 	// The top level plugin configuration. This value is immutable after creation
 	Config *PluginConfig `json:"config"`
 	// DEPRECATED, should be always null
@@ -707,14 +723,31 @@ type PluginConfig struct {
 	EnvVars map[string]string `json:"envvars" example:"SLACK_BOT_TOKEN:eG94Yi10b2tlbg==,SLACK_APP_TOKEN:eC1hcHAtdG9rZW4="`
 }
 
-type PluginConnection struct {
+type PluginResourceConnection struct {
 	// The connection ID reference
 	ConnectionID string `json:"id" format:"uuid" example:"B702C63C-E6EB-46BB-9D1E-90EA077E4582"`
 	// The name of the connection
 	Name string `json:"name" example:"pgdemo"`
-	// The configuration for this plugin. Each plugin could have distinct set of configurations.
-	// Refer to Hoop's documentation for more information.
+	// The configuration of the plugin connection, the content depends on the plugin type
 	Config []string `json:"config" example:"EMAIL_ADDRESS,URL"`
+}
+
+type PluginConnectionRequest struct {
+	// The configuration of the plugin connection, the content depends on the plugin type
+	Config []string `json:"config" example:"sre,devops"`
+}
+
+type PluginConnection struct {
+	// The resource ID
+	ID string `json:"id" format:"uuid" example:"B39D74FA-EF2E-4B0C-A28A-D382B18043C6"`
+	// The plugin id to create associations
+	PluginID string `json:"plugin_id" example:"review"`
+	// The connection ID reference
+	ConnectionID string `json:"connection_id" format:"uuid" example:"B702C63C-E6EB-46BB-9D1E-90EA077E4582"`
+	// The configuration of the plugin connection, the content depends on the plugin type
+	Config []string `json:"config" example:"EMAIL_ADDRESS,URL"`
+	// The time when this resource was updated
+	UpdatedAt time.Time `json:"updated_at" readonly:"true" example:"2024-07-25T19:36:41Z"`
 }
 
 type ProxyManagerRequest struct {
@@ -807,6 +840,13 @@ const (
 	FeatureStatusDisabled FeatureStatusType = "disabled"
 )
 
+type AnalyticsTrackingStatusType string
+
+const (
+	AnalyticsTrackingEnabled  AnalyticsTrackingStatusType = "enabled"
+	AnalyticsTrackingDisabled AnalyticsTrackingStatusType = "disabled"
+)
+
 var FeatureList = []string{"ask-ai"}
 
 type FeatureRequest struct {
@@ -844,23 +884,32 @@ type ServerLicenseInfo struct {
 
 type PublicServerInfo struct {
 	// Auth method used by the server
-	AuthMethod string `json:"auth_method" enums:"oidc,local" example:"local"`
+	AuthMethod string `json:"auth_method" enums:"local,oidc,saml" example:"local"`
 }
+
+type IdpProviderNameType string
+
+const (
+	IdpProviderMicrosoftEntraID IdpProviderNameType = "microsoft-entra-id"
+	IdpProviderOkta             IdpProviderNameType = "okta"
+	IdpProviderGoogle           IdpProviderNameType = "google"
+	IdpProviderAwsCognito       IdpProviderNameType = "aws-cognito"
+	IdpProviderJumpCloud        IdpProviderNameType = "jumpcloud"
+	IdpProviderUnknown          IdpProviderNameType = "unknown"
+)
 
 type ServerInfo struct {
 	// Version of the server
-	Version string `json:"version" example:"1.23.15"`
+	Version string `json:"version" example:"1.35.0"`
 	// Commit SHA of the version
 	Commit string `json:"commit_sha" example:"e6b94e86352e934b66d9c7ab2821a267dc18dfee"`
 	// Log level of the server
 	LogLevel string `json:"log_level" enums:"INFO,WARN,DEBUG,ERROR" example:"INFO"`
 	// Expose `GODEBUG` flags enabled
 	GoDebug string `json:"go_debug" example:"http2debug=2"`
-	// The role name of the admin group
-	AdminUsername string `json:"admin_username" example:"admin"`
 	// Auth method used by the server
 	AuthMethod string `json:"auth_method" enums:"oidc,local" example:"local"`
-	// DLP provider used by the server
+	// Redact Provider used by the server
 	RedactProvider string `json:"redact_provider" enums:"gcp,mspresidio" example:"gcp"`
 	// Report if GOOGLE_APPLICATION_CREDENTIALS_JSON or MSPRESIDIO is set
 	HasRedactCredentials bool `json:"has_redact_credentials"`
@@ -870,23 +919,28 @@ type ServerInfo struct {
 	HasIDPAudience bool `json:"has_idp_audience"`
 	// Report if IDP_CUSTOM_SCOPES env is set
 	HasIDPCustomScopes bool `json:"has_idp_custom_scopes"`
-	// Report if IDP_CUSTOM_SCOPES env is set
-	HasPostgresRole bool `json:"has_postgrest_role"`
 	// Report if ASK_AI_CREDENTIALS is set (openapi credentials)
 	HasAskiAICredentials bool `json:"has_ask_ai_credentials"`
 	// Report if SSH_CLIENT_HOST_KEY is set
 	HasSSHClientHostKey bool `json:"has_ssh_client_host_key"`
-	// API URL advertise to clients
+	// API_URL advertise to clients
 	ApiURL string `json:"api_url" example:"https://api.johnwick.org"`
 	// The GRPC_URL advertise to clients
 	GrpcURL string `json:"grpc_url" example:"127.0.0.1:8009"`
 	// The tenancy type
-	TenancyType string             `json:"tenancy_type" enums:"selfhosted,multitenant"`
+	TenancyType string `json:"tenancy_type" enums:"selfhosted,multitenant"`
+	// License information
 	LicenseInfo *ServerLicenseInfo `json:"license_info"`
+	// The provider name identified based on the configured identity provider credentials
+	IdpProviderName IdpProviderNameType `json:"idp_provider_name"`
 	// Indicates if session download functionality is disabled
 	// * true - Session download is disabled and not available to users
 	// * false - Session download is enabled and available to users
 	DisableSessionsDownload bool `json:"disable_sessions_download"`
+	// Indicates if all tracking and analytics should be enabled or disabled
+	// * enabled - Analytics/tracking are enabled (ANALYTICS_TRACKING=enabled)
+	// * disabled - Analytics/tracking are disabled (ANALYTICS_TRACKING=disabled)
+	AnalyticsTracking string `json:"analytics_tracking" enums:"enabled,disabled" example:"enabled"`
 }
 
 type LivenessCheck struct {
@@ -948,6 +1002,8 @@ type JiraIssueTemplate struct {
 	CreatedAt time.Time `json:"created_at"`
 	// The time when the template was updated
 	UpdatedAt time.Time `json:"updated_at"`
+	// The connection IDs associated with this template
+	ConnectionIDs []string `json:"connection_ids"`
 }
 
 type JiraIssueTemplateRequest struct {
@@ -1024,6 +1080,24 @@ type JiraIssueTemplateRequest struct {
 		}
 	*/
 	CmdbTypes map[string]any `json:"cmdb_types"`
+	// The connection IDs to associate with this template
+	ConnectionIDs []string `json:"connection_ids"`
+}
+
+type JiraAssetObjectValue struct {
+	// The object identifier
+	ID string `json:"id" example:"c1ee84ab-76c8-40d9-a956-13a705d4e605:11013"`
+	// Name of the object value
+	Name string `json:"name" example:"mycomputer-asset"`
+}
+
+type JiraAssetObjects struct {
+	// The object values found
+	Values []JiraAssetObjectValue `json:"values"`
+	// Total amount of records found
+	Total int64 `json:"total" example:"22"`
+	// Indicate if it has more items
+	HasNextPage bool `json:"has_next_page"`
 }
 
 type GuardRailRuleRequest struct {
@@ -1068,6 +1142,9 @@ type GuardRailRuleRequest struct {
 		}
 	*/
 	Output map[string]any `json:"output"`
+
+	// List of connection IDs that this guardrail applies to
+	ConnectionIDs []string `json:"connection_ids" example:"15B5A2FD-0706-4A47-B1CF-B93CCFC5B3D7,15B5A2FD-0706-4A47-B1CF-B93CCFC5B3D8"`
 }
 
 type GuardRailRuleResponse struct {
@@ -1114,6 +1191,9 @@ type GuardRailRuleResponse struct {
 		}
 	*/
 	Output map[string]any `json:"output"`
+
+	// List of connection IDs that this guardrail applies to
+	ConnectionIDs []string `json:"connection_ids" example:"15B5A2FD-0706-4A47-B1CF-B93CCFC5B3D7,15B5A2FD-0706-4A47-B1CF-B93CCFC5B3D8"`
 
 	// The time the resource was created
 	CreatedAt time.Time `json:"created_at" readonly:"true" example:"2024-07-25T15:56:35.317601Z"`
@@ -1258,6 +1338,9 @@ type AWSDBInstance struct {
 	Engine string `json:"engine" example:"postgres"`
 	// Status indicates the current state of the database instance
 	Status string `json:"status" example:"available"`
+	// Contains the connection resources that were already provisioned.
+	// The resources are marked with a specific tag after completion.
+	ConnectionResources []string `json:"connection_resources" example:"pgtest1,pgtest2"`
 	// Contains an error in case it was not able to list the db instances from the account id
 	Error *string `json:"error" example:"IAM account does not have permission to list db instances in this account"`
 }
@@ -1319,6 +1402,8 @@ type DBRoleJob struct {
 	Spec AWSDBRoleJobSpec `json:"spec"`
 	// Current status and results of the job execution (null if not started)
 	Status *DBRoleJobStatus `json:"status"`
+	// The Runbook execution status
+	HookStatus *DBRoleJobHookStatus `json:"hook_status"`
 }
 
 type DBTag struct {
@@ -1346,6 +1431,32 @@ type DBRoleJobStatus struct {
 	Message string `json:"message" example:"All user roles have been successfully provisioned"`
 	// Detailed results for each individual role that was provisioned
 	Result []DBRoleJobStatusResult `json:"result"`
+}
+
+type DBRoleJobHookStatus struct {
+	// The Unix Exit Code of the runbook execution (0=success)
+	ExitCode int `json:"exit_code" example:"0"`
+	// The stdout and stderr streams captured during execution
+	Output string `json:"output" example:"output"`
+	// The time it took to execute the runbook
+	ExecutionTimeSec int `json:"execution_time_sec" example:"5"`
+}
+
+type CreateRdsRootPasswordRequest struct {
+	// the instance arn id to generate credentials for
+	InstanceArnItems []string `json:"instances" binding:"required" example:"db-arn-1,db-arn-2"`
+}
+
+type CreateRdsRootPasswordResponse struct {
+	// The passwords generated by each instance
+	Credentials map[string]CreateRdsRootPasswordCredentialsInfo `json:"credentials"`
+}
+
+type CreateRdsRootPasswordCredentialsInfo struct {
+	// The random password generated for the instance.
+	Password string `json:"password" example:"random-password"`
+	// The time when this password will expire, another random password will be generated after this time and this password will no longer work.
+	ExpireAt time.Time `json:"expire_at" example:"2025-02-28T12:34:56Z"`
 }
 
 type SecretsManagerProviderType string
@@ -1381,4 +1492,352 @@ type DBRoleJobStatusResult struct {
 
 type DBRoleJobList struct {
 	Items []DBRoleJob `json:"items"`
+}
+
+// SchemaInfo represents information about a database schema and its tables
+type SchemaInfo struct {
+	Name   string   `json:"name"`   // The name of the schema
+	Tables []string `json:"tables"` // The tables in the schema
+}
+
+// TablesResponse represents the response for a tables list request
+type TablesResponse struct {
+	Schemas []SchemaInfo `json:"schemas"` // The database schemas
+}
+
+// ColumnsResponse represents the response for a table columns request
+type ColumnsResponse struct {
+	Columns []ConnectionColumn `json:"columns"` // The columns of a table
+}
+
+type DataMaskingRule struct {
+	// The unique identifier of the data masking rule
+	ID                     string `json:"id" format:"uuid" example:"15B5A2FD-0706-4A47-B1CF-B93CCFC5B3D7"`
+	DataMaskingRuleRequest `json:",inline"`
+}
+
+type DataMaskingRuleRequest struct {
+	// The unique name of the data masking rule, it's immutable after creation
+	Name string `json:"name" binding:"required" example:"mask-email"`
+	// The description of the data masking rule
+	Description string `json:"description" example:"Mask email addresses in the data"`
+	// The connections that this rule applies to
+	ConnectionIDs []string `json:"connection_ids" example:"15B5A2FD-0706-4A47-B1CF-B93CCFC5B3D7,15B5A2FD-0706-4A47-B1CF-B93CCFC5B3D8"`
+	// The registered entity types that this rule applies to
+	SupportedEntityTypes []SupportedEntityTypesEntry `json:"supported_entity_types"`
+	// The minimal detection score threshold for the entities to be masked.
+	ScoreThreshold *float64 `json:"score_threshold" example:"0.6"`
+	// The custom entity types that this rule applies to
+	CustomEntityTypesEntrys []CustomEntityTypesEntry `json:"custom_entity_types"`
+	// The timestamp when the rule was updated
+	UpdatedAt time.Time `json:"updated_at" readonly:"true" example:"2023-08-15T14:30:45Z"`
+}
+
+type SupportedEntityTypesEntry struct {
+	// An identifier for this structure, it's used as an identifier of a collection of entities.
+	Name string `json:"name" example:"PII"`
+	// The registered entity types in the redact provider
+	EntityTypes []string `json:"entity_types" example:"EMAIL_ADDRESS,PERSON,PHONE_NUMBER,IP_ADDRESS"`
+}
+
+type CustomEntityTypesEntry struct {
+	// The name of the custom entity type as uppercase
+	Name string `json:"name" binding:"required" example:"ZIP_CODE"`
+	// The regex pattern to match (python) the custom entity type.
+	// Either this or the deny_list is required
+	Regex string `json:"regex" example:"\\b\\d{5}(?:-\\d{4})?\\b"`
+	// List of words to be returned as PII if found.
+	// Either this or the regex is required
+	DenyList []string `json:"deny_list" example:"Mr,Mr.,Mister"`
+	// Detection confidence of this pattern (0.01 if very noisy, 0.6-1.0 if very specific)
+	Score float64 `json:"score" binding:"required" example:"0.01"`
+}
+
+type DataMaskingRuleConnectionRequest struct {
+	// The unique identifier of the data masking rule
+	RuleID string `json:"rule_id" example:"15B5A2FD-0706-4A47-B1CF-B93CCFC5B3D7"`
+	// The status of the data masking rule
+	Status string `json:"status" enums:"active,inactive" example:"active" binding:"required"`
+}
+
+type DataMaskingRuleConnection struct {
+	// The unique identifier of the data masking rule connection
+	ID string `json:"id" example:"15B5A2FD-0706-4A47-B1CF-B93CCFC5B3D7"`
+	// The unique identifier of the data masking rule
+	RuleID string `json:"rule_id" example:"15B5A2FD-0706-4A47-B1CF-B93CCFC5B3D7"`
+	// The unique identifier of the connection
+	ConnectionID string `json:"connection_id" example:"15B5A2FD-0706-4A47-B1CF-B93CCFC5B3D7"`
+	// The status of the data masking rule connection
+	Status string `json:"status" enums:"active,inactive" example:"active"`
+}
+
+type ServerMiscConfig struct {
+	// Either to enable or disable the product analytics tracking
+	ProductAnalytics string `json:"product_analytics" enum:"active,inactive" example:"active"`
+	// The gRPC server URL used to advertise the gRPC server to clients
+	GrpcServerURL string `json:"grpc_server_url" default:"grpc://127.0.0.1:8010"`
+	// The PostgreSQL server proxy configuration
+	PostgresServerConfig *PostgresServerConfig `json:"postgres_server_config"`
+	// The SSH server proxy configuration
+	SSHServerConfig *SSHServerConfig `json:"ssh_server_config"`
+	// The RDP server proxy configuration
+	RDPServerConfig *RDPServerConfig `json:"rdp_server_config"`
+}
+
+type SSHServerConfig struct {
+	// The listen address to run the SSH server proxy
+	ListenAddress string `json:"listen_address" example:"0.0.0.0:12222"`
+	// The hosts key used for SSH connections
+	HostsKey string `json:"hosts_key" example:"base64-pem-encoded-hosts-key"`
+}
+
+type RDPServerConfig struct {
+	// The listen address to run the RDP server proxy
+	ListenAddress string `json:"listen_address" example:"0.0.0.0:3389"`
+}
+
+type PostgresServerConfig struct {
+	// The listen address to run the PostgreSQL server proxy
+	ListenAddress string `json:"listen_address" example:"0.0.0.0:15432"`
+}
+
+type ServerAuthOidcConfig struct {
+	// Identity Provider Issuer URL (Oauth2)
+	IssuerURL string `json:"issuer_url" example:"https://auth.domain.tld/oidc" binding:"required"`
+	// Oauth2 Client ID
+	ClientID string `json:"client_id" example:"hoop-client-id" binding:"required"`
+	// Oauth2 Client Secret
+	ClientSecret string `json:"client_secret" example:"hoop-client-secret" binding:"required"`
+	// Additional Oauth2 scopes to append in the request. Default values are openid, profile and email.
+	Scopes []string `json:"scopes" example:"openid,email,profile"`
+	// Identity Provider Audience (Oauth2)
+	Audience string `json:"audience" example:"hoop-audience"`
+	// Specifies the claim identifier used to configure group propagation.
+	GroupsClaim string `json:"groups_claim" example:"groups"`
+}
+
+type ServerAuthSamlConfig struct {
+	// Identity Provider Metadata URL (SAML 2.0)
+	IdpMetadataURL string `json:"idp_metadata_url" example:"https://auth.domain.tld/saml/metadata" binding:"required"`
+	// Specifies the claim identifier used to configure group propagation.
+	GroupsClaim string `json:"groups_claim" default:"groups"`
+}
+
+type ProviderType string
+
+const (
+	ProviderTypeOIDC  ProviderType = "oidc"
+	ProviderTypeSAML  ProviderType = "saml"
+	ProviderTypeLocal ProviderType = "local"
+)
+
+type ServerAuthConfig struct {
+	// The identity provider type to configure
+	AuthMethod ProviderType `json:"auth_method" example:"local" binding:"required"`
+	// OIDC / Oauth2 identity provider configuration
+	OidcConfig *ServerAuthOidcConfig `json:"oidc_config"`
+	// SAML 2.0 identity provider configuration
+	SamlConfig *ServerAuthSamlConfig `json:"saml_config"`
+	// The provider type name used to identify the authentication provider
+	ProviderName string `json:"provider_name" example:"generic"`
+	// The api key with admin privileges used to authenticate in the API. It is a read only field
+	ApiKey *string `json:"api_key" example:"xapi-WqIAoYhKuIv2IPmVkfsyyK" readonly:"true"`
+	// The api key to rollout. When this field is set, the server will rollout the previous api_key.
+	// This attribute must be obtained in the endpoint to generate rollout api keys.
+	RolloutApiKey *string `json:"rollout_api_key" example:"xapi-WqIAoYhKuIv2IPmVkfsyyK"`
+	// Enable the users management in the Webapp. It allows to create, edit and delete users.
+	WebappUsersManagementStatus string `json:"webapp_users_management_status" enums:"active,inactive" binding:"required"`
+	// Changes the default administrator role of the system
+	AdminRoleName string `json:"admin_role_name" default:"admin"`
+	// Changes the default auditor role of the system
+	AuditorRoleName string `json:"auditor_role_name" default:"auditor"`
+}
+
+type GenerateApiKeyResponse struct {
+	// The API key that was generated to rollout the previous api_key.
+	RolloutApiKey string `json:"rollout_api_key" example:"xapi-WqIAoYhKuIv2IPmVkfsyyK"`
+}
+
+type LocalUserRequest struct {
+	Email    string `json:"email" binding:"required"`
+	Password string `json:"password" binding:"required"`
+	Name     string `json:"name"`
+}
+
+type ConnectionCredentialsRequest struct {
+	AccessDurationSec int `json:"access_duration_seconds"`
+}
+
+type ConnectionCredentialsResponse struct {
+	// The unique identifier of the connection database access
+	ID string `json:"id" format:"uuid" readonly:"true" example:"15B5A2FD-0706-4A47-B1CF-B93CCFC5B3D7"`
+	// The name of the connection
+	ConnectionName string `json:"connection_name" example:"pgdemo"`
+	// Connection type
+	ConnectionType string `json:"connection_type" example:"postgres"`
+	// The connection information
+	ConnectionCredentials any `json:"connection_credentials"`
+	// When the database access connection expires
+	ExpireAt time.Time `json:"expire_at" example:"2025-08-25T13:00:00Z"`
+	// When the resource was created
+	CreatedAt time.Time `json:"created_at" example:"2025-08-25T12:00:00Z"`
+}
+
+type RDPConnectionInfo struct {
+	// The hostname to access the rdp server pinstance
+	Hostname string `json:"hostname" example:"example.com/198.22.2.2"`
+	// The port of the rdp server instance
+	Port string `json:"port" example:"3389"`
+	// The username of the rdp server instance
+	Username string `json:"username" example:"noop"`
+	// The password of the rdp server instance
+	Password string `json:"password" example:"noop"`
+	// The command to access the rdp instance
+	Command string `json:"command" example:"xfreerdp /v:0.0.0.0:3389 /u:fake /p:fake"`
+}
+
+type PostgresConnectionInfo struct {
+	// The hostname to access the database instance
+	Hostname string `json:"hostname" example:"db.example.com"`
+	// The port of the database instance
+	Port string `json:"port" example:"5432"`
+	// The username of the database instance
+	Username string `json:"username" example:"noop"`
+	// The password of the database instance
+	Password string `json:"password" example:"noop"`
+	// The default database name of the connection
+	DatabaseName string `json:"database_name" example:"mydb"`
+	// The connection string to access the database instance
+	ConnectionString string `json:"connection_string" example:"postgres://noop:noop@db.example.com:5432/mydb?sslmode=disable"`
+}
+
+type SSHConnectionInfo struct {
+	// The hostname to access the SSH instance
+	Hostname string `json:"hostname" example:"ssh.example.com"`
+	// The port of the SSH instance
+	Port string `json:"port" example:"22"`
+	// The username of the SSH instance
+	Username string `json:"username" example:"noop"`
+	// The password of the SSH instance
+	Password string `json:"password" example:"noop"`
+	// The command to access the SSH instance
+	Command string `json:"command" example:"ssh -p 22"`
+}
+
+type ConnectionSearch struct {
+	// Unique ID of the resource
+	ID string `json:"id" readonly:"true" format:"uuid" example:"5364ec99-653b-41ba-8165-67236e894990"`
+	// Name of the connection. This attribute is immutable when updating it
+	Name string `json:"name" binding:"required" example:"pgdemo"`
+	// Type represents the main type of the connection:
+	// * database - Database protocols
+	// * application - Custom applications
+	// * custom - Shell applications
+	Type string `json:"type" binding:"required" enums:"database,application,custom" example:"database"`
+	// Sub Type is the underline implementation of the connection:
+	// * postgres - Implements Postgres protocol
+	// * mysql - Implements MySQL protocol
+	// * mongodb - Implements MongoDB Wire Protocol
+	// * mssql - Implements Microsoft SQL Server Protocol
+	// * oracledb - Implements Oracle Database Protocol
+	// * tcp - Forwards a TCP connection
+	// * ssh - Forwards a SSH connection
+	// * httpproxy - Forwards a HTTP connection
+	// * dynamodb - AWS DynamoDB experimental integration
+	// * cloudwatch - AWS CloudWatch experimental integration
+	SubType string `json:"subtype" example:"postgres"`
+	// Status is a read only field that informs if the connection is available for interaction
+	// * online - The agent is connected and alive
+	// * offline - The agent is not connected
+	Status string `json:"status" readonly:"true" enums:"online,offline"`
+	// Toggle Ad Hoc Runbooks Executions
+	// * enabled - Enable to run runbooks for this connection
+	// * disabled - Disable runbooks execution for this connection
+	AccessModeRunbooks string `json:"access_mode_runbooks" binding:"required" enums:"enabled,disabled"`
+	// Toggle Ad Hoc Executions
+	// * enabled - Enable to run ad-hoc executions for this connection
+	// * disabled - Disable ad-hoc executions for this connection
+	AccessModeExec string `json:"access_mode_exec" binding:"required" enums:"enabled,disabled"`
+	// Toggle Port Forwarding
+	// * enabled - Enable to perform port forwarding for this connection
+	// * disabled - Disable port forwarding for this connection
+	AccessModeConnect string `json:"access_mode_connect" binding:"required" enums:"enabled,disabled"`
+}
+
+type SearchResponse struct {
+	// Connections found in the search
+	Connections []ConnectionSearch `json:"connections"`
+	// Runbooks found in the search
+	Runbooks []string `json:"runbooks" example:"myrunbooks/run-backup.runbook.sql,myrunbooks/run-update.runbook.sql"`
+}
+
+type ConnectionTestResponse struct {
+	// Indicates if the connection test was successful
+	Success bool `json:"success" example:"true"`
+}
+
+type ResourceRoleRequest struct {
+	// Name of the connection. This attribute is immutable when updating it
+	Name string `json:"name" binding:"required" example:"pgdemo"`
+	// Is the shell command that is going to be executed when interacting with this connection.
+	// This value is required if the connection is going to be used from the Webapp.
+	Command []string `json:"command" example:"/bin/bash"`
+	// Type represents the main type of the connection:
+	// * database - Database protocols
+	// * application - Custom applications
+	// * custom - Shell applications
+	Type string `json:"type" binding:"required" enums:"database,application,custom" example:"database"`
+	// Sub Type is the underline implementation of the connection:
+	// * postgres - Implements Postgres protocol
+	// * mysql - Implements MySQL protocol
+	// * mongodb - Implements MongoDB Wire Protocol
+	// * mssql - Implements Microsoft SQL Server Protocol
+	// * oracledb - Implements Oracle Database Protocol
+	// * tcp - Forwards a TCP connection
+	// * ssh - Forwards a SSH connection
+	// * httpproxy - Forwards a HTTP connection
+	// * dynamodb - AWS DynamoDB experimental integration
+	// * cloudwatch - AWS CloudWatch experimental integration
+	SubType string `json:"subtype" example:"postgres"`
+	// Secrets are environment variables that are going to be exposed
+	// in the runtime of the connection:
+	// * { envvar:[env-key]: [base64-val] } - Expose the value as environment variable
+	// * { filesystem:[env-key]: [base64-val] } - Expose the value as a temporary file path creating the value in the filesystem
+	//
+	// The value could also represent an integration with a external provider:
+	// * { envvar:[env-key]: _aws:[secret-name]:[secret-key] } - Obtain the value dynamically in the AWS secrets manager and expose as environment variable
+	// * { envvar:[env-key]: _envjson:[json-env-name]:[json-env-key] } - Obtain the value dynamically from a JSON env in the agent runtime. Example: MYENV={"KEY": "val"}
+	Secrets map[string]any `json:"secret"`
+	// The agent associated with this connection
+	AgentID string `json:"agent_id" format:"uuid" example:"1837453e-01fc-46f3-9e4c-dcf22d395393"`
+}
+
+type ResourceRequest struct {
+	// The resource name
+	Name string `json:"name" binding:"required" example:"my-resource"`
+	// The resource type
+	Type string `json:"type" binding:"required" example:"mysql"`
+	// The resource environment variables
+	EnvVars map[string]string `json:"env_vars" binding:"required"`
+	// The agent associated with this resource
+	AgentID string `json:"agent_id" binding:"required" format:"uuid" example:"1837453e-01fc-46f3-9e4c-dcf22d395393"`
+	// The roles associated with this resource
+	Roles []ResourceRoleRequest `json:"roles" binding:"required,dive"`
+}
+
+type ResourceResponse struct {
+	// The resource ID
+	ID string `json:"id" format:"uuid" readonly:"true" example:"15B5A2FD-0706-4A47-B1CF-B93CCFC5B3D7"`
+	// The resource name
+	Name string `json:"name" example:"my-resource"`
+	// The resource type
+	Type string `json:"type" example:"mysql"`
+	// The resource environment variables
+	EnvVars map[string]string `json:"env_vars"`
+	// The agent associated with this resource
+	AgentID string `json:"agent_id" binding:"required" format:"uuid" example:"1837453e-01fc-46f3-9e4c-dcf22d395393"`
+	// The time the resource was created
+	CreatedAt time.Time `json:"created_at" readonly:"true" example:"2024-07-25T15:56:35.317601Z"`
+	// The time the resource was updated
+	UpdatedAt time.Time `json:"updated_at" readonly:"true" example:"2024-07-25T15:56:35.317601Z"`
 }

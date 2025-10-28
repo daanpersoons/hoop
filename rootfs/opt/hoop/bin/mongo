@@ -1,0 +1,21 @@
+#!/bin/bash
+set -eo pipefail
+
+: "${HOOP_SESSION_ID:?Required environment variable}"
+[[ "$CONNECTION_DEBUG" == "1" ]] && set -x
+
+
+# legacy mongo cli
+MONGO_BIN=/usr/local/bin/mongo
+if [ ! -f "$HOME/.mongoshrc.js" ]; then
+    # https://www.mongodb.com/docs/mongodb-shell/reference/customize-prompt/#std-label-customize-the-mongosh-prompt
+    echo 'prompt = function() { return ""; }' > $HOME/.mongoshrc.js
+fi
+
+# it's inject by the agent if it contains the comment hoop.dev/runtime=mongosh
+# the user is indicating that they want to use the mongosh runtime
+if [ "$HOOP_EXEC_MONGOSH_RUNTIME" == "1" ]; then
+    MONGO_BIN=/usr/bin/mongosh
+fi
+
+$MONGO_BIN $@

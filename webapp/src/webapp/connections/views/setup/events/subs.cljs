@@ -20,6 +20,11 @@
    (get-in db [:connection-setup :subtype])))
 
 (rf/reg-sub
+ :connection-setup/from-catalog?
+ (fn [db _]
+   (get-in db [:connection-setup :from-catalog?] false)))
+
+(rf/reg-sub
  :connection-setup/name
  (fn [db]
    (get-in db [:connection-setup :name])))
@@ -41,9 +46,19 @@
    (get-in db [:connection-setup :database-credentials])))
 
 (rf/reg-sub
- :connection-setup/command
+ :connection-setup/metadata-credentials
+ (fn [db _]
+   (get-in db [:connection-setup :metadata-credentials])))
+
+(rf/reg-sub
+ :connection-setup/command-args
  (fn [db]
-   (get-in db [:connection-setup :command] "")))
+   (get-in db [:connection-setup :command-args] [])))
+
+(rf/reg-sub
+ :connection-setup/command-current-arg
+ (fn [db]
+   (get-in db [:connection-setup :command-current-arg] "")))
 
 ;; Configuration and features
 (rf/reg-sub
@@ -212,3 +227,9 @@
  :connection-setup/ssh-credentials
  (fn [db]
    (get-in db [:connection-setup :ssh-credentials] {})))
+
+;; Resource Subtype Override subscription
+(rf/reg-sub
+ :connection-setup/resource-subtype-override
+ (fn [db]
+   (get-in db [:connection-setup :resource-subtype-override])))

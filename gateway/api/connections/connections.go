@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/getsentry/sentry-go"
@@ -15,15 +16,12 @@ import (
 	"github.com/hoophq/hoop/common/apiutils"
 	"github.com/hoophq/hoop/common/log"
 	pb "github.com/hoophq/hoop/common/proto"
+	"github.com/hoophq/hoop/gateway/api/apiroutes"
 	"github.com/hoophq/hoop/gateway/api/openapi"
 	"github.com/hoophq/hoop/gateway/clientexec"
 	"github.com/hoophq/hoop/gateway/models"
-	"github.com/hoophq/hoop/gateway/pgrest"
-	pgplugins "github.com/hoophq/hoop/gateway/pgrest/plugins"
 	"github.com/hoophq/hoop/gateway/storagev2"
-	"github.com/hoophq/hoop/gateway/storagev2/types"
 	"github.com/hoophq/hoop/gateway/transport/connectionrequests"
-	plugintypes "github.com/hoophq/hoop/gateway/transport/plugins/types"
 	"github.com/hoophq/hoop/gateway/transport/streamclient"
 	streamtypes "github.com/hoophq/hoop/gateway/transport/streamclient/types"
 )
@@ -54,7 +52,7 @@ func Post(c *gin.Context) {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"message": err.Error()})
 		return
 	}
-	existingConn, err := models.GetConnectionByNameOrID(ctx.OrgID, req.Name)
+	existingConn, err := models.GetConnectionByNameOrID(ctx, req.Name)
 	if err != nil {
 		log.Errorf("failed fetching existing connection, err=%v", err)
 		sentry.CaptureException(err)
@@ -69,20 +67,21 @@ func Post(c *gin.Context) {
 	setConnectionDefaults(&req)
 
 	req.ID = uuid.NewString()
-	req.Status = pgrest.ConnectionStatusOffline
+	req.Status = models.ConnectionStatusOffline
 	if streamclient.IsAgentOnline(streamtypes.NewStreamID(req.AgentId, "")) {
-		req.Status = pgrest.ConnectionStatusOnline
+		req.Status = models.ConnectionStatusOnline
 	}
 
-	err = models.UpsertConnection(&models.Connection{
+	resp, err := models.UpsertConnection(ctx, &models.Connection{
 		ID:                  req.ID,
 		OrgID:               ctx.OrgID,
+		ResourceName:        req.ResourceName,
 		AgentID:             sql.NullString{String: req.AgentId, Valid: true},
 		Name:                req.Name,
 		Command:             req.Command,
-		Type:                string(req.Type),
+		Type:                req.Type,
 		SubType:             sql.NullString{String: req.SubType, Valid: true},
-		Envs:                coerceToMapString(req.Secrets),
+		Envs:                CoerceToMapString(req.Secrets),
 		Status:              req.Status,
 		ManagedBy:           sql.NullString{},
 		Tags:                req.Tags,
@@ -90,36 +89,18 @@ func Post(c *gin.Context) {
 		AccessModeExec:      req.AccessModeExec,
 		AccessModeConnect:   req.AccessModeConnect,
 		AccessSchema:        req.AccessSchema,
+		Reviewers:           req.Reviewers,
+		RedactTypes:         req.RedactTypes,
 		GuardRailRules:      req.GuardRailRules,
 		JiraIssueTemplateID: sql.NullString{String: req.JiraIssueTemplateID, Valid: true},
 		ConnectionTags:      req.ConnectionTags,
 	})
 	if err != nil {
 		log.Errorf("failed creating connection, err=%v", err)
-		sentry.CaptureException(err)
 		c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
 		return
 	}
-	pgplugins.EnableDefaultPlugins(ctx, req.ID, req.Name, pgplugins.DefaultPluginNames)
-	// configure review and dlp plugins (best-effort)
-	for _, pluginName := range []string{plugintypes.PluginReviewName, plugintypes.PluginDLPName} {
-		// skip configuring redact if the client doesn't set redact_enabled
-		// it maintain compatibility with old clients since we enable dlp with default redact types
-		if pluginName == plugintypes.PluginDLPName && !req.RedactEnabled {
-			continue
-		}
-		pluginConnConfig := req.Reviewers
-		if pluginName == plugintypes.PluginDLPName {
-			pluginConnConfig = req.RedactTypes
-		}
-		pgplugins.UpsertPluginConnection(ctx, pluginName, &types.PluginConnection{
-			ID:           uuid.NewString(),
-			ConnectionID: req.ID,
-			Name:         req.Name,
-			Config:       pluginConnConfig,
-		})
-	}
-	c.JSON(http.StatusCreated, req)
+	c.JSON(http.StatusCreated, toOpenApi(resp))
 }
 
 // UpdateConnection
@@ -137,10 +118,9 @@ func Post(c *gin.Context) {
 func Put(c *gin.Context) {
 	ctx := storagev2.ParseContext(c)
 	connNameOrID := c.Param("nameOrID")
-	conn, err := models.GetConnectionByNameOrID(ctx.OrgID, connNameOrID)
+	conn, err := models.GetConnectionByNameOrID(ctx, connNameOrID)
 	if err != nil {
 		log.Errorf("failed fetching connection, err=%v", err)
-		sentry.CaptureException(err)
 		c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
 		return
 	}
@@ -168,19 +148,20 @@ func Put(c *gin.Context) {
 	// immutable fields
 	req.ID = conn.ID
 	req.Name = conn.Name
-	req.Status = pgrest.ConnectionStatusOffline
+	req.Status = models.ConnectionStatusOffline
 	if streamclient.IsAgentOnline(streamtypes.NewStreamID(req.AgentId, "")) {
-		req.Status = pgrest.ConnectionStatusOnline
+		req.Status = models.ConnectionStatusOnline
 	}
-	err = models.UpsertConnection(&models.Connection{
+	resp, err := models.UpsertConnection(ctx, &models.Connection{
 		ID:                  conn.ID,
 		OrgID:               conn.OrgID,
+		ResourceName:        req.ResourceName,
 		AgentID:             sql.NullString{String: req.AgentId, Valid: true},
 		Name:                conn.Name,
 		Command:             req.Command,
 		Type:                req.Type,
 		SubType:             sql.NullString{String: req.SubType, Valid: true},
-		Envs:                coerceToMapString(req.Secrets),
+		Envs:                CoerceToMapString(req.Secrets),
 		Status:              req.Status,
 		ManagedBy:           sql.NullString{},
 		Tags:                req.Tags,
@@ -188,6 +169,8 @@ func Put(c *gin.Context) {
 		AccessModeExec:      req.AccessModeExec,
 		AccessModeConnect:   req.AccessModeConnect,
 		AccessSchema:        req.AccessSchema,
+		Reviewers:           req.Reviewers,
+		RedactTypes:         req.RedactTypes,
 		GuardRailRules:      req.GuardRailRules,
 		JiraIssueTemplateID: sql.NullString{String: req.JiraIssueTemplateID, Valid: true},
 		ConnectionTags:      req.ConnectionTags,
@@ -198,31 +181,11 @@ func Put(c *gin.Context) {
 			c.JSON(http.StatusUnprocessableEntity, gin.H{"message": err.Error()})
 		default:
 			log.Errorf("failed updating connection, err=%v", err)
-			sentry.CaptureException(err)
 			c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
 		}
 		return
 	}
-	connectionrequests.InvalidateSyncCache(ctx.OrgID, conn.Name)
-	// configure review and dlp plugins (best-effort)
-	for _, pluginName := range []string{plugintypes.PluginReviewName, plugintypes.PluginDLPName} {
-		// skip configuring redact if the client doesn't set redact_enabled
-		// it maintain compatibility with old clients since we enable dlp with default redact types
-		if pluginName == plugintypes.PluginDLPName && !req.RedactEnabled {
-			continue
-		}
-		pluginConnConfig := req.Reviewers
-		if pluginName == plugintypes.PluginDLPName {
-			pluginConnConfig = req.RedactTypes
-		}
-		pgplugins.UpsertPluginConnection(ctx, pluginName, &types.PluginConnection{
-			ID:           uuid.NewString(),
-			ConnectionID: conn.ID,
-			Name:         req.Name,
-			Config:       pluginConnConfig,
-		})
-	}
-	c.JSON(http.StatusOK, req)
+	c.JSON(http.StatusOK, toOpenApi(resp))
 }
 
 // DeleteConnection
@@ -244,7 +207,7 @@ func Delete(c *gin.Context) {
 	}
 	err := models.DeleteConnection(ctx.OrgID, connName)
 	switch err {
-	case pgrest.ErrNotFound:
+	case models.ErrNotFound:
 		c.JSON(http.StatusNotFound, gin.H{"message": "not found"})
 	case nil:
 		connectionrequests.InvalidateSyncCache(ctx.OrgID, connName)
@@ -278,56 +241,18 @@ func List(c *gin.Context) {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"message": err.Error()})
 		return
 	}
-	connList, err := models.ListConnections(ctx.OrgID, filterOpts)
+	connList, err := models.ListConnections(ctx, filterOpts)
 	if err != nil {
-		sentry.CaptureException(err)
-		c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
-		return
-	}
-	allowedFn, err := accessControlAllowed(ctx)
-	if err != nil {
-		log.Errorf("failed validating connection access control, err=%v", err)
-		sentry.CaptureException(err)
+		log.Errorf("failed listing connections, reason=%v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
 		return
 	}
 	responseConnList := []openapi.Connection{}
 	for _, conn := range connList {
-		if allowedFn(conn.Name) {
-			var managedBy *string
-			if conn.ManagedBy.Valid {
-				managedBy = &conn.ManagedBy.String
-			}
-			defaultDB, _ := base64.StdEncoding.DecodeString(conn.Envs["envvar:DB"])
-			if len(defaultDB) == 0 {
-				defaultDB = []byte(``)
-			}
-			responseConnList = append(responseConnList, openapi.Connection{
-				ID:      conn.ID,
-				Name:    conn.Name,
-				Command: conn.Command,
-				Type:    conn.Type,
-				SubType: conn.SubType.String,
-				// it should return empty to avoid leaking sensitive content
-				// in the future we plan to know which entry is sensitive or not
-				Secrets:             nil,
-				DefaultDatabase:     string(defaultDB),
-				AgentId:             conn.AgentID.String,
-				Status:              conn.Status,
-				Reviewers:           conn.Reviewers,
-				RedactEnabled:       conn.RedactEnabled,
-				RedactTypes:         conn.RedactTypes,
-				ManagedBy:           managedBy,
-				Tags:                conn.Tags,
-				ConnectionTags:      conn.ConnectionTags,
-				AccessModeRunbooks:  conn.AccessModeRunbooks,
-				AccessModeExec:      conn.AccessModeExec,
-				AccessModeConnect:   conn.AccessModeConnect,
-				AccessSchema:        conn.AccessSchema,
-				GuardRailRules:      conn.GuardRailRules,
-				JiraIssueTemplateID: conn.JiraIssueTemplateID.String,
-			})
-		}
+		// it should return empty to avoid leaking sensitive content
+		// in the future we plan to know which entry is sensitive or not
+		conn.Envs = map[string]string{}
+		responseConnList = append(responseConnList, toOpenApi(&conn))
 
 	}
 	c.JSON(http.StatusOK, responseConnList)
@@ -345,25 +270,21 @@ func List(c *gin.Context) {
 //	@Router			/connections/{nameOrID} [get]
 func Get(c *gin.Context) {
 	ctx := storagev2.ParseContext(c)
-	conn, err := models.GetConnectionByNameOrID(ctx.OrgID, c.Param("nameOrID"))
+	conn, err := models.GetBareConnectionByNameOrID(ctx, c.Param("nameOrID"), models.DB)
 	if err != nil {
 		log.Errorf("failed fetching connection, err=%v", err)
-		sentry.CaptureException(err)
 		c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
 		return
 	}
-	allowedFn, err := accessControlAllowed(ctx)
-	if err != nil {
-		log.Errorf("failed validating connection access control, err=%v", err)
-		sentry.CaptureException(err)
-		c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
-		return
-	}
-	if conn == nil || !allowedFn(conn.Name) {
+	if conn == nil {
 		c.JSON(http.StatusNotFound, gin.H{"message": "not found"})
 		return
 	}
 
+	c.JSON(http.StatusOK, toOpenApi(conn))
+}
+
+func toOpenApi(conn *models.Connection) openapi.Connection {
 	var managedBy *string
 	if conn.ManagedBy.Valid {
 		managedBy = &conn.ManagedBy.String
@@ -372,9 +293,10 @@ func Get(c *gin.Context) {
 	if len(defaultDB) == 0 {
 		defaultDB = []byte(``)
 	}
-	c.JSON(http.StatusOK, openapi.Connection{
+	return openapi.Connection{
 		ID:                  conn.ID,
 		Name:                conn.Name,
+		ResourceName:        conn.ResourceName,
 		Command:             conn.Command,
 		Type:                conn.Type,
 		SubType:             conn.SubType.String,
@@ -394,23 +316,7 @@ func Get(c *gin.Context) {
 		AccessSchema:        conn.AccessSchema,
 		GuardRailRules:      conn.GuardRailRules,
 		JiraIssueTemplateID: conn.JiraIssueTemplateID.String,
-	})
-}
-
-// FetchByName fetches a connection based in access control rules
-func FetchByName(ctx pgrest.Context, connectionName string) (*models.Connection, error) {
-	conn, err := models.GetConnectionByNameOrID(ctx.GetOrgID(), connectionName)
-	if err != nil {
-		return nil, err
 	}
-	allowedFn, err := accessControlAllowed(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if conn == nil || !allowedFn(conn.Name) {
-		return nil, nil
-	}
-	return conn, nil
 }
 
 // ListDatabases return a list of databases for a given connection
@@ -427,7 +333,7 @@ func ListDatabases(c *gin.Context) {
 	ctx := storagev2.ParseContext(c)
 	connNameOrID := c.Param("nameOrID")
 
-	conn, err := FetchByName(ctx, connNameOrID)
+	conn, err := models.GetConnectionByNameOrID(ctx, connNameOrID)
 	if err != nil {
 		log.Errorf("failed fetching connection, err=%v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
@@ -453,6 +359,7 @@ SELECT datname as database_name
 FROM pg_database
 WHERE datistemplate = false
   AND datname != 'postgres'
+	AND datname != 'rdsadmin'
 ORDER BY datname;`
 
 	case pb.ConnectionTypeMongoDB:
@@ -468,6 +375,11 @@ dbs.databases.forEach(function(database) {
 	});
 });
 print(JSON.stringify(result));`
+	case pb.ConnectionTypeMySQL:
+		script = `
+SELECT schema_name AS database_name
+FROM information_schema.schemata
+ORDER BY schema_name;`
 
 	default:
 		log.Warnf("unsupported database type: %v", currentConnectionType)
@@ -477,10 +389,11 @@ print(JSON.stringify(result));`
 
 	userAgent := apiutils.NormalizeUserAgent(c.Request.Header.Values)
 	client, err := clientexec.New(&clientexec.Options{
-		OrgID:          ctx.GetOrgID(),
-		ConnectionName: conn.Name,
-		BearerToken:    getAccessToken(c),
-		UserAgent:      userAgent,
+		OrgID:                     ctx.GetOrgID(),
+		ConnectionName:            conn.Name,
+		ConnectionCommandOverride: getConnectionCommandOverride(currentConnectionType, conn.Command),
+		BearerToken:               apiroutes.GetAccessTokenFromRequest(c),
+		UserAgent:                 userAgent,
 		// it sets the execution to perform plain executions
 		Verb: pb.ClientVerbPlainExec,
 	})
@@ -545,31 +458,25 @@ print(JSON.stringify(result));`
 	}
 }
 
-// GetDatabaseSchema return detailed schema information including tables, views, columns and indexes
+// ListTables returns only the tables of a database without column details
 //
-//	@Summary		Get Database Schema
-//	@Description	Get detailed schema information including tables, views, columns and indexes
+//	@Summary		List Database Tables
+//	@Description	List tables from a database without column details
 //	@Tags			Connections
 //	@Produce		json
 //	@Param			nameOrID	path		string	true	"Name or UUID of the connection"
-//	@Param			database	path		string	true	"Name of the database"
-//	@Success		200			{object}	openapi.ConnectionSchemaResponse
+//	@Param			database	query		string	true	"Name of the database"
+//	@Param			schema		query		string	false	"Name of the schema (optional - if not provided, returns tables from all schemas)"
+//	@Success		200			{object}	openapi.TablesResponse
 //	@Failure		400,404,500	{object}	openapi.HTTPError
-//	@Router			/connections/{nameOrID}/schemas [get]
-func GetDatabaseSchemas(c *gin.Context) {
+//	@Router			/connections/{nameOrID}/tables [get]
+func ListTables(c *gin.Context) {
 	ctx := storagev2.ParseContext(c)
 	connNameOrID := c.Param("nameOrID")
 	dbName := c.Query("database")
+	schemaName := c.Query("schema")
 
-	// Validate database name to prevent SQL injection
-	if dbName != "" {
-		if err := validateDatabaseName(dbName); err != nil {
-			c.JSON(http.StatusUnprocessableEntity, gin.H{"message": err.Error()})
-			return
-		}
-	}
-
-	conn, err := FetchByName(ctx, connNameOrID)
+	conn, err := models.GetConnectionByNameOrID(ctx, connNameOrID)
 	if err != nil {
 		log.Errorf("failed fetching connection, err=%v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
@@ -581,35 +488,243 @@ func GetDatabaseSchemas(c *gin.Context) {
 		return
 	}
 
-	if conn.Type != "database" {
+	isDatabaseConnection := conn.Type == "database" ||
+		(conn.Type == "custom" && conn.SubType.String == "dynamodb") ||
+		(conn.Type == "custom" && conn.SubType.String == "cloudwatch")
+	if !isDatabaseConnection {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "connection is not a database type"})
 		return
 	}
 
 	currentConnectionType := pb.ToConnectionType(conn.Type, conn.SubType.String)
 
-	if dbName == "" {
-		connEnvs := conn.Envs
-		switch currentConnectionType {
-		case pb.ConnectionTypePostgres,
-			pb.ConnectionTypeMSSQL,
-			pb.ConnectionTypeMySQL:
-			dbName = getEnvValue(connEnvs, "envvar:DB")
-		case pb.ConnectionTypeMongoDB:
-			if connStr := connEnvs["envvar:CONNECTION_STRING"]; connStr != "" {
-				dbName = getMongoDBFromConnectionString(connStr)
-			}
-		case pb.ConnectionTypeOracleDB:
-			dbName = getEnvValue(connEnvs, "envvar:SID")
+	// Verify if dbName is needed (except for DynamoDB)
+	needsDbName := currentConnectionType == pb.ConnectionTypePostgres ||
+		currentConnectionType == pb.ConnectionTypeMySQL ||
+		currentConnectionType == pb.ConnectionTypeMongoDB
+
+	// DynamoDB doesn't need dbName
+	if conn.Type == "custom" && conn.SubType.String == "dynamodb" ||
+		conn.Type == "custom" && conn.SubType.String == "cloudwatch" {
+		needsDbName = false
+	}
+
+	// For database types that require dbName
+	if needsDbName {
+		// Check if provided
+		if dbName == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"message": "database parameter is required for this database type"})
+			return
 		}
 
-		if dbName == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"message": "database name is required but not found in connection or query parameter"})
+		// Validate format
+		if err := validateDatabaseName(dbName); err != nil {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"message": err.Error()})
 			return
 		}
 	}
 
-	script := getSchemaQuery(currentConnectionType, dbName)
+	script := getTablesQuery(currentConnectionType, dbName)
+	if script == "" {
+		// Check for DynamoDB
+		if conn.Type == "custom" && conn.SubType.String == "dynamodb" {
+			script = `aws dynamodb list-tables --output json`
+		}
+	}
+
+	if script == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "unsupported database type"})
+		return
+	}
+
+	userAgent := apiutils.NormalizeUserAgent(c.Request.Header.Values)
+	client, err := clientexec.New(&clientexec.Options{
+		OrgID:                     ctx.GetOrgID(),
+		ConnectionName:            conn.Name,
+		ConnectionCommandOverride: getConnectionCommandOverride(currentConnectionType, conn.Command),
+		BearerToken:               apiroutes.GetAccessTokenFromRequest(c),
+		UserAgent:                 userAgent,
+		Verb:                      pb.ClientVerbPlainExec,
+	})
+	if err != nil {
+		log.Error(err)
+		c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
+		return
+	}
+
+	respCh := make(chan *clientexec.Response)
+	go func() {
+		defer func() { close(respCh); client.Close() }()
+		select {
+		case respCh <- client.Run([]byte(script), nil):
+		default:
+		}
+	}()
+
+	timeoutCtx, cancelFn := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancelFn()
+	select {
+	case outcome := <-respCh:
+		if outcome.ExitCode != 0 {
+			log.Warnf("failed issuing plain exec: %s, output=%v", outcome.String(), outcome.Output)
+			c.JSON(http.StatusBadRequest, gin.H{"message": fmt.Sprintf("failed to list tables: %s", outcome.Output)})
+			return
+		}
+
+		var response openapi.TablesResponse
+
+		// Check for DynamoDB
+		if conn.Type == "custom" && conn.SubType.String == "dynamodb" {
+			// Special parsing for DynamoDB
+			tables, err := parseDynamoDBTables(outcome.Output)
+			if err != nil {
+				log.Errorf("failed parsing DynamoDB response: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"message": fmt.Sprintf("failed to parse DynamoDB response: %v", err)})
+				return
+			}
+			response = tables
+		} else if currentConnectionType == pb.ConnectionTypeCloudWatch {
+			// Special parsing for CloudWatch
+			tables, err := parseCloudWatchTables(outcome.Output)
+			if err != nil {
+				log.Errorf("failed parsing CloudWatch response: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"message": fmt.Sprintf("failed to parse CloudWatch response: %v", err)})
+				return
+			}
+			response = tables
+		} else if currentConnectionType == pb.ConnectionTypeMongoDB {
+			// Parse MongoDB output
+			tables, err := parseMongoDBTables(outcome.Output)
+			if err != nil {
+				log.Errorf("failed parsing mongo response: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"message": fmt.Sprintf("failed to parse MongoDB response: %v", err)})
+				return
+			}
+			response = tables
+		} else {
+			// Parse SQL output
+			tables, err := parseSQLTables(outcome.Output, currentConnectionType)
+			if err != nil {
+				log.Errorf("failed parsing SQL response: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"message": fmt.Sprintf("failed to parse SQL response: %v", err)})
+				return
+			}
+
+			// If a specific schema was requested, filter the results
+			if schemaName != "" {
+				filteredSchemas := []openapi.SchemaInfo{}
+				for _, schema := range tables.Schemas {
+					if schema.Name == schemaName {
+						filteredSchemas = append(filteredSchemas, schema)
+						break
+					}
+				}
+				tables.Schemas = filteredSchemas
+			}
+
+			response = tables
+		}
+
+		c.JSON(http.StatusOK, response)
+
+	case <-timeoutCtx.Done():
+		client.Close()
+		log.Warnf("timeout (30s) obtaining tables for database '%s' using connection '%s'", dbName, conn.Name)
+		c.JSON(http.StatusBadRequest, gin.H{
+			"message":    fmt.Sprintf("Request timed out (30s) while fetching tables for database '%s'", dbName),
+			"connection": conn.Name,
+			"database":   dbName,
+			"timeout":    "30s",
+		})
+	}
+}
+
+// GetTableColumns returns the columns of a specific table
+//
+//	@Summary		Get Table Columns
+//	@Description	Get columns from a specific table
+//	@Tags			Connections
+//	@Produce		json
+//	@Param			nameOrID	path		string	true	"Name or UUID of the connection"
+//	@Param			database	query		string	true	"Name of the database"
+//	@Param			table		query		string	true	"Name of the table"
+//	@Param			schema		query		string	false	"Name of the schema (optional - for PostgreSQL default is 'public', for others defaults to database name)"
+//	@Success		200			{object}	openapi.ColumnsResponse
+//	@Failure		400,404,500	{object}	openapi.HTTPError
+//	@Router			/connections/{nameOrID}/columns [get]
+func GetTableColumns(c *gin.Context) {
+	ctx := storagev2.ParseContext(c)
+	connNameOrID := c.Param("nameOrID")
+	dbName := c.Query("database")
+	tableName := c.Query("table")
+	schemaName := c.Query("schema")
+
+	if tableName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "table parameter is required"})
+		return
+	}
+
+	conn, err := models.GetConnectionByNameOrID(ctx, connNameOrID)
+	if err != nil {
+		log.Errorf("failed fetching connection, err=%v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
+		return
+	}
+
+	if conn == nil {
+		c.JSON(http.StatusNotFound, gin.H{"message": "connection not found"})
+		return
+	}
+
+	isDatabaseConnection := conn.Type == "database" ||
+		(conn.Type == "custom" && conn.SubType.String == "dynamodb")
+	if !isDatabaseConnection {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "connection is not a database type"})
+		return
+	}
+
+	currentConnectionType := pb.ToConnectionType(conn.Type, conn.SubType.String)
+
+	// Verify if dbName is needed (except for DynamoDB)
+	needsDbName := currentConnectionType == pb.ConnectionTypePostgres ||
+		currentConnectionType == pb.ConnectionTypeMySQL ||
+		currentConnectionType == pb.ConnectionTypeMongoDB
+
+	// DynamoDB doesn't need dbName
+	if currentConnectionType == pb.ConnectionTypeDynamoDB {
+		needsDbName = false
+	}
+
+	// For database types that require dbName
+	if needsDbName {
+		// Check if provided
+		if dbName == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"message": "database parameter is required for this database type"})
+			return
+		}
+
+		// Validate format
+		if err := validateDatabaseName(dbName); err != nil {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"message": err.Error()})
+			return
+		}
+	}
+
+	if schemaName == "" {
+		schemaName = dbName
+		if currentConnectionType == pb.ConnectionTypePostgres {
+			schemaName = "public"
+		}
+	}
+
+	script := getColumnsQuery(currentConnectionType, dbName, tableName, schemaName)
+	if script == "" {
+		// Check for DynamoDB
+		if currentConnectionType == pb.ConnectionTypeDynamoDB {
+			script = fmt.Sprintf(`aws dynamodb describe-table --table-name %s --output json`, tableName)
+		}
+	}
+
 	if script == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "unsupported database type"})
 		return
@@ -619,7 +734,7 @@ func GetDatabaseSchemas(c *gin.Context) {
 	client, err := clientexec.New(&clientexec.Options{
 		OrgID:          ctx.GetOrgID(),
 		ConnectionName: conn.Name,
-		BearerToken:    getAccessToken(c),
+		BearerToken:    apiroutes.GetAccessTokenFromRequest(c),
 		UserAgent:      userAgent,
 		Verb:           pb.ClientVerbPlainExec,
 	})
@@ -638,45 +753,150 @@ func GetDatabaseSchemas(c *gin.Context) {
 		}
 	}()
 
-	timeoutCtx, cancelFn := context.WithTimeout(context.Background(), time.Second*50)
+	timeoutCtx, cancelFn := context.WithTimeout(context.Background(), time.Second*30)
 	defer cancelFn()
 	select {
 	case outcome := <-respCh:
 		if outcome.ExitCode != 0 {
-			log.Errorf("failed issuing plain exec: %s, output=%v", outcome.String(), outcome.Output)
-			c.JSON(http.StatusInternalServerError, gin.H{"message": fmt.Sprintf("failed to get schema: %s", outcome.Output)})
+			log.Warnf("failed issuing plain exec: %s, output=%v", outcome.String(), outcome.Output)
+			c.JSON(http.StatusBadRequest, gin.H{"message": fmt.Sprintf("failed to get columns: %s", outcome.Output)})
 			return
 		}
 
-		var schema openapi.ConnectionSchemaResponse
-		var err error
+		response := openapi.ColumnsResponse{Columns: []openapi.ConnectionColumn{}}
 
-		if currentConnectionType == pb.ConnectionTypeMongoDB {
-			output := cleanMongoOutput(outcome.Output)
-			schema, err = parseMongoDBSchema(output)
-		} else {
-			schema, err = parseSQLSchema(outcome.Output, currentConnectionType)
-		}
-
-		if err != nil {
-			log.Errorf("failed parsing schema response: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"message": fmt.Sprintf("failed to parse schema: %v", err)})
-			return
-		}
-
-		if c.Request.Method == "HEAD" {
-			contentLength := -1
-			if jsonBody, err := json.Marshal(schema); err == nil {
-				contentLength = len(jsonBody)
+		// Check for DynamoDB
+		if currentConnectionType == pb.ConnectionTypeDynamoDB {
+			// Special parsing for DynamoDB
+			columns, err := parseDynamoDBColumns(outcome.Output)
+			if err != nil {
+				log.Errorf("failed parsing DynamoDB response: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"message": fmt.Sprintf("failed to parse DynamoDB response: %v", err)})
+				return
 			}
-			c.Writer.Header().Set("Content-Length", fmt.Sprintf("%v", contentLength))
-			return
+			response.Columns = columns
+		} else if currentConnectionType == pb.ConnectionTypeMongoDB {
+			// Parse MongoDB output
+			columns, err := parseMongoDBColumns(outcome.Output)
+			if err != nil {
+				log.Errorf("failed parsing mongo response: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"message": fmt.Sprintf("failed to parse MongoDB response: %v", err)})
+				return
+			}
+			response.Columns = columns
+		} else {
+			// Parse SQL output
+			columns, err := parseSQLColumns(outcome.Output, currentConnectionType)
+			if err != nil {
+				log.Errorf("failed parsing SQL response: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"message": fmt.Sprintf("failed to parse SQL response: %v", err)})
+				return
+			}
+			response.Columns = columns
 		}
-		c.JSON(http.StatusOK, schema)
+
+		c.JSON(http.StatusOK, response)
 
 	case <-timeoutCtx.Done():
 		client.Close()
-		log.Infof("runexec timeout (50s), it will return async")
-		c.JSON(http.StatusBadRequest, gin.H{"message": "Request timed out"})
+		log.Warnf("timeout (30s) obtaining columns for table '%s' in database '%s' using connection '%s'", tableName, dbName, conn.Name)
+		c.JSON(http.StatusBadRequest, gin.H{
+			"message":    fmt.Sprintf("Request timed out (30s) while fetching columns for table '%s'", tableName),
+			"connection": conn.Name,
+			"database":   dbName,
+			"table":      tableName,
+			"timeout":    "30s",
+		})
 	}
+}
+
+// Test Connection
+//
+//	@Summary		Test Connection
+//	@Description	Test resource by name or id (only for database connections, it will attempt a simple ping).
+//	@Tags				Connections
+//	@Param			nameOrID	path	string	true	"Name or UUID of the connection"
+//	@Produce		json
+//	@Success		200		{object}	openapi.ConnectionTestResponse
+//	@Failure		404,500	{object}	openapi.HTTPError
+//	@Router			/connections/{nameOrID}/test [get]
+func TestConnection(c *gin.Context) {
+	ctx := storagev2.ParseContext(c)
+	conn, err := models.GetConnectionByNameOrID(ctx, c.Param("nameOrID"))
+	if err != nil {
+		log.Errorf("failed fetching connection, err=%v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
+		return
+	}
+	if conn == nil {
+		c.JSON(http.StatusNotFound, gin.H{"message": "connection not found"})
+		return
+	}
+
+	testConnectionErr := testConnection(ctx, apiroutes.GetAccessTokenFromRequest(c), conn)
+	if testConnectionErr != nil {
+		log.Warnf("connection ping test failed, err=%v", testConnectionErr)
+		c.JSON(http.StatusBadRequest, gin.H{"message": fmt.Sprintf("connection test failed: %v", testConnectionErr)})
+		return
+	}
+
+	c.JSON(http.StatusOK, openapi.ConnectionTestResponse{
+		Success: true,
+	})
+}
+
+func getScriptsForTestConnection(connectionType *pb.ConnectionType) (string, error) {
+	switch *connectionType {
+	case pb.ConnectionTypePostgres, pb.ConnectionTypeMySQL, pb.ConnectionTypeMSSQL:
+		return "SELECT 1", nil
+	case pb.ConnectionTypeOracleDB:
+		return "SELECT 1 FROM dual;", nil
+	case pb.ConnectionTypeMongoDB:
+		return `// Ensure verbosity is off
+if (typeof noVerbose === 'function') noVerbose();
+if (typeof config !== 'undefined') config.verbosity = 0;
+printjson(db.runCommand({ping:1}));`, nil
+	case pb.ConnectionTypeDynamoDB:
+		return "aws dynamodb list-tables --max-items 1 --output json", nil
+	case pb.ConnectionTypeCloudWatch:
+		return "aws logs describe-log-groups --output json", nil
+	default:
+		return "", fmt.Errorf("unsupported connection type: %v", connectionType.String())
+	}
+}
+
+func testConnection(ctx *storagev2.Context, bearerToken string, conn *models.Connection) error {
+	client, err := clientexec.New(&clientexec.Options{
+		OrgID:          ctx.GetOrgID(),
+		ConnectionName: conn.Name,
+		BearerToken:    bearerToken,
+		UserAgent:      "webapp.editor.testconnection",
+		Verb:           pb.ClientVerbPlainExec,
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed creating client: %w", err)
+	}
+
+	defer client.Close()
+
+	currentConnectionType := pb.ToConnectionType(conn.Type, conn.SubType.String)
+	command, err := getScriptsForTestConnection(&currentConnectionType)
+	if err != nil {
+		return err
+	}
+
+	outcome := client.Run([]byte(command), nil)
+	if outcome.ExitCode != 0 {
+		return fmt.Errorf("failed issuing test command, output=%v", outcome.Output)
+	}
+
+	// Custom handling for OracleDB, as it returns always exit code 0 even if the command fails
+	if currentConnectionType == pb.ConnectionTypeOracleDB && strings.HasPrefix(strings.ToLower(outcome.Output), "error") {
+		return fmt.Errorf("failed issuing test command, output=%v", outcome.Output)
+	}
+
+	log.Infof("successful connection test for connection '%s': %v", conn.Name, outcome.Output)
+
+	return nil
 }

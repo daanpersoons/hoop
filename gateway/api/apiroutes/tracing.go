@@ -14,7 +14,6 @@ var vs = version.Get()
 func contextTracerMiddleware() gin.HandlerFunc {
 	conf := appconfig.Get()
 	environment := conf.ApiHostname()
-	grpcURL := conf.GrpcURL()
 	tenancyType := "selfhosted"
 	if conf.OrgMultitenant() {
 		tenancyType = "multitenant"
@@ -28,9 +27,8 @@ func contextTracerMiddleware() gin.HandlerFunc {
 		}
 		span.SetAttributes(
 			attribute.String("hoop.gateway.environment", environment),
-			attribute.String("hoop.gateway.grpc-url", grpcURL),
 			attribute.String("hoop.gateway.tenancy-type", tenancyType),
-			attribute.String("hoop.gateway.auth-method", authMethod),
+			attribute.String("hoop.gateway.auth-method", string(authMethod)),
 			attribute.String("hoop.gateway.platform", vs.Platform),
 			attribute.String("hoop.gateway.version", vs.Version),
 		)

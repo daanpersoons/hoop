@@ -46,7 +46,9 @@
                                                        :user-management? (= (:webapp_users_management user) "on")
                                                        :free-license? (not (and (:is_valid license-info)
                                                                                 (= (:type license-info) "enterprise")))
-                                                       :admin? (:is_admin user))})
+                                                       :admin? (:is_admin user)
+                                                       ;;:tenancy_type "multi-tenant"
+                                                       )})
       :fx [[:dispatch [:initialize-intercom user]]
            [:dispatch [:close-page-loader]]]})))
 
@@ -55,7 +57,7 @@
  (fn
    [{:keys [db]} [_ new-user]]
    (let [success (fn []
-                   (rf/dispatch [:close-modal])
+                   (rf/dispatch [:modal->close])
                    (rf/dispatch [:users->get-users])
                    (rf/dispatch [:users->get-user-groups])
                    (rf/dispatch [:show-snackbar {:level :success
@@ -71,7 +73,7 @@
  (fn
    [{:keys [db]} [_ user]]
    (let [success (fn []
-                   (rf/dispatch [:close-modal])
+                   (rf/dispatch [:modal->close])
                    (rf/dispatch [:users->get-users])
                    (rf/dispatch [:users->get-user-groups])
                    (rf/dispatch [:show-snackbar {:level :success

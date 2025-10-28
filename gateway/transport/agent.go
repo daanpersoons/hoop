@@ -5,7 +5,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/getsentry/sentry-go"
 	"github.com/hoophq/hoop/common/log"
 	pb "github.com/hoophq/hoop/common/proto"
 	pbagent "github.com/hoophq/hoop/common/proto/agent"
@@ -88,8 +87,13 @@ func (s *Server) listenAgentMessages(pctx *plugintypes.Context, stream *streamcl
 		extContext := transportext.Context{
 			OrgID:                               pctx.OrgID,
 			SID:                                 pctx.SID,
+			AgentID:                             pctx.AgentID,
 			ConnectionName:                      proxyStream.PluginContext().ConnectionName,
+			ConnectionType:                      proxyStream.PluginContext().ConnectionType,
+			ConnectionSubType:                   proxyStream.PluginContext().ConnectionSubType,
+			ConnectionEnvs:                      proxyStream.PluginContext().ConnectionSecret,
 			ConnectionJiraTransitionNameOnClose: proxyStream.PluginContext().ConnectionJiraTransitionNameOnClose,
+			UserEmail:                           proxyStream.PluginContext().UserEmail,
 			Verb:                                proxyStream.PluginContext().ClientVerb,
 		}
 
@@ -100,7 +104,6 @@ func (s *Server) listenAgentMessages(pctx *plugintypes.Context, stream *streamcl
 
 		if _, err := proxyStream.PluginExecOnReceive(*pctx, pkt); err != nil {
 			log.With("sid", pctx.SID).Warnf("plugin reject packet, err=%v", err)
-			sentry.CaptureException(err)
 			return status.Errorf(codes.Internal, "internal error, plugin reject packet")
 		}
 
@@ -115,7 +118,7 @@ func (s *Server) listenAgentMessages(pctx *plugintypes.Context, stream *streamcl
 		}
 
 		if err = proxyStream.Send(pkt); err != nil {
-			log.With("sid", pctx.SID).Debugf("failed to send packet to proxy stream, err=%v", err)
+			log.With("sid", pctx.SID).Debugf("failed to send packet to proxy stream, type=%v, err=%v", pkt.Type, err)
 		}
 	}
 }
@@ -123,7 +126,7 @@ func (s *Server) listenAgentMessages(pctx *plugintypes.Context, stream *streamcl
 func handleSystemPacketResponses(pctx *plugintypes.Context, pkt *pb.Packet) (handled bool) {
 	if strings.HasPrefix(pkt.Type, "Sys") {
 		if err := transportsystem.Send(pkt.Type, pctx.SID, pkt.Payload); err != nil {
-			log.Warnf("unable to send system packet, reason=%v", err)
+			log.With("sid", pctx.SID).Warnf("unable to send system packet, type=%v, reason=%v", pkt.Type, err)
 		}
 		return true
 	}

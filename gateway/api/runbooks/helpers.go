@@ -1,60 +1,19 @@
 package apirunbooks
 
 import (
-	"bytes"
 	"fmt"
 	"strings"
 
-	"github.com/gin-gonic/gin"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/hoophq/hoop/common/runbooks"
 	"github.com/hoophq/hoop/gateway/api/openapi"
-	"github.com/hoophq/hoop/gateway/api/runbooks/templates"
-	"github.com/hoophq/hoop/gateway/storagev2/types"
+	"github.com/hoophq/hoop/gateway/models"
 )
 
 const maxTemplateSize = 1000000 // 1MB
 
-func fetchRunbookFile(config *templates.RunbookConfig, req openapi.RunbookRequest) (*openapi.Runbook, error) {
-	c, err := templates.FetchRepo(config)
-	if err != nil {
-		return nil, err
-	}
-	if c.Hash.IsZero() {
-		return nil, fmt.Errorf("commit hash from remote is empty")
-	}
-	if req.RefHash != "" && req.RefHash != c.Hash.String() {
-		return nil, fmt.Errorf("mismatch git commit, want=%v, have=%v", req.RefHash, c.Hash.String())
-	}
-	if ctree, _ := c.Tree(); ctree != nil {
-		f := templates.LookupFile(req.FileName, ctree)
-		if f != nil {
-			blob, err := templates.ReadBlob(f)
-			if err != nil {
-				return nil, err
-			}
-			if len(blob) > maxTemplateSize {
-				return nil, fmt.Errorf("max template size [%v KB] reached for %v", maxTemplateSize/1000, f.Name)
-			}
-			t, err := templates.Parse(string(blob))
-			if err != nil {
-				return nil, err
-			}
-			parsedTemplate := bytes.NewBuffer([]byte{})
-			if err := t.Execute(parsedTemplate, req.Parameters); err != nil {
-				return nil, err
-			}
-			return &openapi.Runbook{
-				Name:       f.Name,
-				InputFile:  parsedTemplate.Bytes(),
-				EnvVars:    t.EnvVars(),
-				CommitHash: c.Hash.String()}, nil
-		}
-	}
-	return nil, fmt.Errorf("runbook %v not found for %v", req.FileName, c.Hash.String())
-}
-
-func listRunbookFiles(pluginConnectionList []*types.PluginConnection, config *templates.RunbookConfig) (*openapi.RunbookList, error) {
-	commit, err := templates.FetchRepo(config)
+func listRunbookFiles(pluginConnectionList []*models.PluginConnection, config *runbooks.Config) (*openapi.RunbookList, error) {
+	commit, err := runbooks.CloneRepositoryInMemory(config)
 	if err != nil {
 		return nil, err
 	}
@@ -69,18 +28,18 @@ func listRunbookFiles(pluginConnectionList []*types.PluginConnection, config *te
 		return runbookList, nil
 	}
 	return runbookList, ctree.Files().ForEach(func(f *object.File) error {
-		if !templates.IsRunbookFile(f.Name) {
+		if !runbooks.IsRunbookFile(f.Name) {
 			return nil
 		}
 		var connectionList []string
 		for _, conn := range pluginConnectionList {
 			if len(conn.Config) == 0 {
-				connectionList = append(connectionList, conn.Name)
+				connectionList = append(connectionList, conn.ConnectionName)
 				continue
 			}
 			pathPrefix := conn.Config[0]
 			if pathPrefix != "" && strings.HasPrefix(f.Name, pathPrefix) {
-				connectionList = append(connectionList, conn.Name)
+				connectionList = append(connectionList, conn.ConnectionName)
 			}
 		}
 
@@ -90,7 +49,7 @@ func listRunbookFiles(pluginConnectionList []*types.PluginConnection, config *te
 			ConnectionList: connectionList,
 			Error:          nil,
 		}
-		blobData, err := templates.ReadBlob(f)
+		blobData, err := runbooks.ReadBlob(f)
 		if err != nil {
 			runbook.Error = toPtrStr(err)
 			runbookList.Items = append(runbookList.Items, runbook)
@@ -101,7 +60,7 @@ func listRunbookFiles(pluginConnectionList []*types.PluginConnection, config *te
 			runbookList.Items = append(runbookList.Items, runbook)
 			return nil
 		}
-		t, err := templates.Parse(string(blobData))
+		t, err := runbooks.Parse(string(blobData))
 		if err != nil {
 			runbook.Error = toPtrStr(fmt.Errorf("template parse error: %v", err))
 			runbookList.Items = append(runbookList.Items, runbook)
@@ -113,8 +72,8 @@ func listRunbookFiles(pluginConnectionList []*types.PluginConnection, config *te
 	})
 }
 
-func listRunbookFilesByPathPrefix(pathPrefix string, config *templates.RunbookConfig) (*openapi.RunbookList, error) {
-	commit, err := templates.FetchRepo(config)
+func listRunbookFilesByPathPrefix(pathPrefix string, config *runbooks.Config) (*openapi.RunbookList, error) {
+	commit, err := runbooks.CloneRepositoryInMemory(config)
 	if err != nil {
 		return nil, err
 	}
@@ -129,7 +88,7 @@ func listRunbookFilesByPathPrefix(pathPrefix string, config *templates.RunbookCo
 		return runbookList, nil
 	}
 	return runbookList, ctree.Files().ForEach(func(f *object.File) error {
-		if !templates.IsRunbookFile(f.Name) {
+		if !runbooks.IsRunbookFile(f.Name) {
 			return nil
 		}
 		if pathPrefix != "" && !strings.HasPrefix(f.Name, pathPrefix) {
@@ -141,7 +100,7 @@ func listRunbookFilesByPathPrefix(pathPrefix string, config *templates.RunbookCo
 			ConnectionList: nil,
 			Error:          nil,
 		}
-		blobData, err := templates.ReadBlob(f)
+		blobData, err := runbooks.ReadBlob(f)
 		if err != nil {
 			runbook.Error = toPtrStr(err)
 			runbookList.Items = append(runbookList.Items, runbook)
@@ -152,7 +111,7 @@ func listRunbookFilesByPathPrefix(pathPrefix string, config *templates.RunbookCo
 			runbookList.Items = append(runbookList.Items, runbook)
 			return nil
 		}
-		t, err := templates.Parse(string(blobData))
+		t, err := runbooks.Parse(string(blobData))
 		if err != nil {
 			runbook.Error = toPtrStr(fmt.Errorf("template parse error: %v", err))
 			runbookList.Items = append(runbookList.Items, runbook)
@@ -171,17 +130,4 @@ func toPtrStr(v any) *string {
 	}
 	val := fmt.Sprintf("%v", v)
 	return &val
-}
-
-func getAccessToken(c *gin.Context) string {
-	tokenHeader := c.GetHeader("authorization")
-	apiKey := c.GetHeader("Api-Key")
-	if apiKey != "" {
-		return apiKey
-	}
-	tokenParts := strings.Split(tokenHeader, " ")
-	if len(tokenParts) > 1 {
-		return tokenParts[1]
-	}
-	return ""
 }

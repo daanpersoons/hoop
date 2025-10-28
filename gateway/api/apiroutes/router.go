@@ -5,7 +5,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/hoophq/hoop/common/log"
-	"github.com/hoophq/hoop/gateway/security/idp"
+	"github.com/hoophq/hoop/gateway/appconfig"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 )
 
@@ -32,12 +32,10 @@ func routeTypeFromContext(c *gin.Context) string {
 
 type Router struct {
 	*gin.RouterGroup
-	provider         *idp.Provider
-	grpcURL          string
-	registeredApiKey string
+	apiURL string
 }
 
-func New(route *gin.RouterGroup, provider *idp.Provider, grpcURL, registeredApiKey string) *Router {
+func New(route *gin.RouterGroup) *Router {
 	if route == nil {
 		log.Fatalf("route is nil")
 	}
@@ -49,10 +47,8 @@ func New(route *gin.RouterGroup, provider *idp.Provider, grpcURL, registeredApiK
 	))
 	route.Use(contextTracerMiddleware())
 	return &Router{
-		RouterGroup:      route,
-		provider:         provider,
-		registeredApiKey: registeredApiKey,
-		grpcURL:          grpcURL,
+		RouterGroup: route,
+		apiURL:      appconfig.Get().ApiURL(),
 	}
 }
 

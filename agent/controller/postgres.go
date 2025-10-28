@@ -48,15 +48,32 @@ func (a *Agent) processPGProtocol(pkt *pb.Packet) {
 	}
 
 	log.Infof("session=%v - starting postgres connection at %v:%v", sessionID, connenv.host, connenv.port)
+
+	var dataMaskingEntityTypesData string
+	if connParams.DataMaskingEntityTypesData != nil {
+		dataMaskingEntityTypesData = string(connParams.DataMaskingEntityTypesData)
+	}
+	var guardRailRules string
+	if connParams.GuardRailRules != nil {
+		guardRailRules = string(connParams.GuardRailRules)
+	}
+
 	opts := map[string]string{
-		"hostname":              connenv.host,
-		"port":                  connenv.port,
-		"username":              connenv.user,
-		"password":              connenv.pass,
-		"sslmode":               connenv.postgresSSLMode,
-		"dlp_gcp_credentials":   a.getGCPCredentials(),
-		"dlp_info_types":        strings.Join(connParams.DLPInfoTypes, ","),
-		"dlp_masking_character": "#",
+		"sid":                       sessionID,
+		"hostname":                  connenv.host,
+		"port":                      connenv.port,
+		"username":                  connenv.user,
+		"password":                  connenv.pass,
+		"sslmode":                   connenv.postgresSSLMode,
+		"dlp_provider":              connParams.DlpProvider,
+		"dlp_mode":                  connParams.DlpMode,
+		"mspresidio_analyzer_url":   connParams.DlpPresidioAnalyzerURL,
+		"mspresidio_anonymizer_url": connParams.DlpPresidioAnonymizerURL,
+		"dlp_gcp_credentials":       connParams.DlpGcpRawCredentialsJSON,
+		"dlp_info_types":            strings.Join(connParams.DLPInfoTypes, ","),
+		"dlp_masking_character":     "#",
+		"data_masking_entity_data":  dataMaskingEntityTypesData,
+		"guard_rail_rules":          guardRailRules,
 	}
 	serverWriter, err := libhoop.NewDBCore(context.Background(), streamClient, opts).Postgres()
 	if err != nil {

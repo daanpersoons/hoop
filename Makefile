@@ -12,6 +12,8 @@ OS := $(shell echo "$(GOOS)" | awk '{print toupper(substr($$0, 1, 1)) tolower(su
 SYMLINK_ARCH := $(if $(filter $(GOARCH),amd64),x86_64,$(if $(filter $(GOARCH),arm64),aarch64,$(ARCH)))
 POSTREST_ARCH_SUFFIX := $(if $(filter $(GOARCH),amd64),linux-static-x64.tar.xz,$(if $(filter $(GOARCH),arm64),ubuntu-aarch64.tar.xz,$(ARCH)))
 
+RUST_TARGET := $(if $(filter $(GOOS),linux),$(if $(filter $(GOARCH),amd64),x86_64-unknown-linux-gnu,$(if $(filter $(GOARCH),arm64),aarch64-unknown-linux-gnu)),$(if $(filter $(GOOS),windows),$(if $(filter $(GOARCH),amd64),x86_64-pc-windows-gnu,$(if $(filter $(GOARCH),arm64),aarch64-pc-windows-gnu))))
+
 LDFLAGS := "-s -w \
 -X github.com/hoophq/hoop/common/version.version=${VERSION} \
 -X github.com/hoophq/hoop/common/version.gitCommit=${GITCOMMIT} \
@@ -21,14 +23,30 @@ LDFLAGS := "-s -w \
 -X github.com/hoophq/hoop/gateway/analytics.segmentApiKey=${SEGMENT_API_KEY} \
 -X github.com/hoophq/hoop/gateway/analytics.intercomHmacKey=${INTERCOM_HMAC_KEY}"
 
+build-dev-rust:
+	echo "Building hoop_rs for dev"
+	cd agentrs && cross build --release --target aarch64-unknown-linux-gnu
+	mkdir -p ${HOME}/.hoop/bin
+	cp agentrs/target/aarch64-unknown-linux-gnu/release/agentrs ${HOME}/.hoop/bin/hoop_rs
+	chmod +x ${HOME}/.hoop/bin/hoop_rs
+
+install-rust:
+	./scripts/install-rust.sh
+
 run-dev:
 	./scripts/dev/run.sh
 
 run-dev-postgres:
 	./scripts/dev/run-postgres.sh
 
+run-dev-presidio:
+	./scripts/dev/run-presidio.sh
+
 build-dev-client:
 	go build -ldflags "-s -w -X github.com/hoophq/hoop/client/proxy.defaultListenAddrValue=0.0.0.0" -o ${HOME}/.hoop/bin/hoop github.com/hoophq/hoop/client
+
+build-dev-webapp:
+	./scripts/dev/build-webapp.sh
 
 test: test-oss test-enterprise
 
@@ -51,8 +69,23 @@ swag-fmt:
 publish:
 	./scripts/publish-release.sh
 
-build:
+build-rust:
 	rm -rf ${DIST_FOLDER}/binaries/${GOOS}_${GOARCH} && mkdir -p ${DIST_FOLDER}/binaries/${GOOS}_${GOARCH}
+	@if [ "${GOOS}" = "windows" ] || [ "${GOOS}" = "darwin" ]; then \
+		echo "Skipping Rust build for ${GOOS} - not supported"; \
+	elif [ -n "${RUST_TARGET}" ]; then \
+		cd agentrs && cross build --release --target ${RUST_TARGET} && \
+		if [ -f "target/${RUST_TARGET}/release/agentrs" ]; then \
+			BINARY_PATH="target/${RUST_TARGET}/release/agentrs"; \
+		else \
+			BINARY_PATH=$$(find . -name "agentrs" -type f | head -1); \
+		fi && \
+		cp "$$BINARY_PATH" ../${DIST_FOLDER}/binaries/${GOOS}_${GOARCH}/hoop_rs; \
+	else \
+		echo "Skipping Rust build for ${GOOS} - no RUST_TARGET defined"; \
+	fi 
+
+build: build-rust
 	env CGO_ENABLED=0 GOOS=${GOOS} GOARCH=${GOARCH} go build -ldflags ${LDFLAGS} -o ${DIST_FOLDER}/binaries/${GOOS}_${GOARCH}/ client/hoop.go
 	tar -czvf ${DIST_FOLDER}/binaries/hoop_${VERSION}_${OS}_${GOARCH}.tar.gz -C ${DIST_FOLDER}/binaries/${GOOS}_${GOARCH} .
 	tar -czvf ${DIST_FOLDER}/binaries/hoop_${VERSION}_${OS}_${SYMLINK_ARCH}.tar.gz -C ${DIST_FOLDER}/binaries/${GOOS}_${GOARCH} .
@@ -82,9 +115,6 @@ build-gateway-bundle:
 	mkdir -p ${DIST_FOLDER}/hoopgateway/opt/hoop/bin
 	mkdir -p ${DIST_FOLDER}/hoopgateway/opt/hoop/migrations
 	mkdir -p ${DIST_FOLDER}/hoopgateway/opt/hoop/webapp
-	curl -sL https://github.com/PostgREST/postgrest/releases/download/v11.2.2/postgrest-v11.2.2-${POSTREST_ARCH_SUFFIX} -o postgrest.tar.xz && \
-	tar -xf postgrest.tar.xz -C ${DIST_FOLDER}/hoopgateway/opt/hoop/bin/ && rm -f postgrest.tar.xz && \
-	chmod 0755 ${DIST_FOLDER}/hoopgateway/opt/hoop/bin/postgrest && \
 	tar -xf ${DIST_FOLDER}/binaries/hoop_${VERSION}_Linux_${GOARCH}.tar.gz -C ${DIST_FOLDER}/hoopgateway/opt/hoop/bin/ && \
 	cp rootfs/app/migrations/*.up.sql ${DIST_FOLDER}/hoopgateway/opt/hoop/migrations/ && \
 	tar -xf ${DIST_FOLDER}/webapp.tar.gz -C ${DIST_FOLDER}/hoopgateway/opt/hoop/webapp --strip 1 && \
@@ -123,4 +153,4 @@ publish-sentry-sourcemaps:
 	tar -xvf ${DIST_FOLDER}/webapp.tar.gz
 	sentry-cli sourcemaps upload --release=$$(cat ./version.txt) ./public/js/app.js.map --org hoopdev --project webapp
 
-.PHONY: run-dev run-dev-postgres test-enterprise test-oss test generate-openapi-docs build build-dev-client build-webapp build-helm-chart build-gateway-bundle extract-webapp publish release release-aws-cf-templates swag-fmt
+.PHONY: run-dev run-dev-postgres build-dev-webapp test-enterprise test-oss test generate-openapi-docs build build-dev-client build-webapp build-helm-chart build-gateway-bundle extract-webapp publish release release-aws-cf-templates swag-fmt build-rust build-dev-rust install-rust

@@ -8,34 +8,40 @@ func (c ConnectionType) String() string { return string(c) }
 func (c ConnectionType) Bytes() []byte  { return []byte(c) }
 
 const (
-	SpecGatewaySessionID             string = "gateway.session_id"
-	SpecConnectionName               string = "gateway.connection_name"
-	SpecConnectionType               string = "gateway.connection_type"
-	SpecHasReviewKey                 string = "gateway.has_review"
-	SpecPluginDcmDataKey             string = "plugin.dcm_data"
-	SpecDLPTransformationSummary     string = "dlp.transformation_summary" // Deprecated: see spectypes.DataMaskingInfoKey
-	SpecClientConnectionID           string = "client.connection_id"
-	SpecClientExitCodeKey            string = "client.exit_code"
-	SpecClientRequestPort            string = "client.request_port"
-	SpecClientSSHHostKey             string = "client.ssh_host_key"
-	SpecClientExecArgsKey            string = "terminal.args"
-	SpecClientExecEnvVar             string = "terminal.envvars"
-	SpecAgentConnectionParamsKey     string = "agent.connection_params"
+	SpecGatewaySessionID         string = "gateway.session_id"
+	SpecConnectionName           string = "gateway.connection_name"
+	SpecConnectionType           string = "gateway.connection_type"
+	SpecConnectionCommand        string = "gateway.connection_command"
+	SpecHasReviewKey             string = "gateway.has_review"
+	SpecPluginDcmDataKey         string = "plugin.dcm_data"
+	SpecDLPTransformationSummary string = "dlp.transformation_summary" // Deprecated: see spectypes.DataMaskingInfoKey
+	SpecClientConnectionID       string = "client.connection_id"
+	SpecClientExitCodeKey        string = "client.exit_code"
+	SpecClientRequestPort        string = "client.request_port"
+	SpecClientSSHHostKey         string = "client.ssh_host_key"
+	SpecClientExecCommandKey     string = "client.command"
+	SpecClientExecArgsKey        string = "terminal.args"
+	SpecClientExecEnvVar         string = "terminal.envvars"
+	SpecAgentConnectionParamsKey string = "agent.connection_params"
+
+	// DEPRECATED: spec items deprecated
 	SpecAgentDlpProvider             string = "agent.dlp_provider"
 	SpecAgentMSPresidioAnalyzerURL   string = "agent.mspresidio_analyzer_url"
 	SpecAgentMSPresidioAnonymizerURL string = "agent.mspresidio_anonymizer_url"
 	SpecAgentGCPRawCredentialsKey    string = "agent.gcp_credentials"
-	SpecTCPServerConnectKey          string = "tcp.server_connect"
-	SpecReviewDataKey                string = "review.data"
-	SpecGatewayReviewID              string = "review.id"
-	SpecGatewayJitID                 string = "jit.id"
-	SpecJitStatus                    string = "jit.status"
-	SpecJitTimeout                   string = "jit.timeout"
+
+	SpecTCPServerConnectKey string = "tcp.server_connect"
+	SpecReviewDataKey       string = "review.data"
+	SpecGatewayReviewID     string = "review.id"
+	SpecGatewayJitID        string = "jit.id"
+	SpecJitStatus           string = "jit.status"
+	SpecJitTimeout          string = "jit.timeout"
 
 	DefaultKeepAlive time.Duration = 10 * time.Second
 
 	ConnectionTypeCommandLine ConnectionType = "command-line"
-	ConnectionTypeCustom      ConnectionType = "custom"
+	ConnectionTypeDynamoDB    ConnectionType = "dynamodb"
+	ConnectionTypeCloudWatch  ConnectionType = "cloudwatch"
 	ConnectionTypePostgres    ConnectionType = "postgres"
 	ConnectionTypeMySQL       ConnectionType = "mysql"
 	ConnectionTypeMSSQL       ConnectionType = "mssql"
@@ -44,6 +50,7 @@ const (
 	ConnectionTypeTCP         ConnectionType = "tcp"
 	ConnectionTypeHttpProxy   ConnectionType = "httpproxy"
 	ConnectionTypeSSH         ConnectionType = "ssh"
+	ConnectionTypeRDP         ConnectionType = "rdp"
 
 	ConnectionOriginAgent              = "agent"
 	ConnectionOriginClient             = "client"

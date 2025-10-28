@@ -37,6 +37,7 @@ Gateway Commit: %v
 Webapp Commit:  %v
 
 Configuration:
+  IDP Provider:            %v
   Log Level:               %v
   Go Debug:                %v
   Admin Username:          %v
@@ -45,7 +46,6 @@ Configuration:
   Ask AI Credentials:      %v
   IDP Audience:            %v
   IDP Custom Scopes:       %v
-  Postgrest Role:          %v
   SSH Client Host Key      %v
 
 License:
@@ -101,6 +101,7 @@ var serverInfoCmd = &cobra.Command{
 				resp["version"],
 				resp["gateway_commit"],
 				resp["webapp_commit"],
+				resp["auth_method"],
 				resp["log_level"],
 				resp["go_debug"],
 				resp["admin_username"],
@@ -109,7 +110,6 @@ var serverInfoCmd = &cobra.Command{
 				displayFn(resp["has_ask_ai_credentials"]),
 				displayFn(resp["has_idp_audience"]),
 				displayFn(resp["has_idp_custom_scopes"]),
-				displayFn(resp["has_postgrest_role"]),
 				displayFn(resp["has_ssh_client_host_key"]),
 				licenseInfo["key_id"],
 				licenseInfo["type"],

@@ -1,8 +1,10 @@
 (ns webapp.onboarding.aws-connect
   (:require [re-frame.core :as rf]
-            ["@radix-ui/themes" :refer [Badge Box Button Card Spinner Link Flex Heading Separator Text Callout Switch]]
+            ["@radix-ui/themes" :refer [Badge Box Button Card Spinner Link Flex
+                                        Heading Separator Text Callout Switch
+                                        AlertDialog RadioGroup Checkbox]]
             [webapp.components.forms :as forms]
-            ["lucide-react" :refer [Check Info ArrowUpRight X]]
+            ["lucide-react" :refer [Check Info ArrowUpRight ChevronUp ChevronDown X Download]]
             [webapp.connections.views.setup.page-wrapper :as page-wrapper]
             [webapp.onboarding.setup-resource :refer [aws-resources-data-table]]
             [webapp.components.data-table-simple :refer [data-table-simple]]
@@ -58,6 +60,20 @@
    {:value "us-gov-east-1" :text "us-gov-east-1"}
    {:value "us-gov-west-1" :text "us-gov-west-1"}])
 
+(def validation-error (r/atom nil))
+
+(defn download-credentials-file [credentials]
+  (let [json-content (js/JSON.stringify (clj->js credentials) nil 2)
+        blob (js/Blob. [json-content] #js {:type "application/json"})
+        url (js/URL.createObjectURL blob)
+        link (js/document.createElement "a")]
+    (set! (.-href link) url)
+    (set! (.-download link) "hoop-aws-database-credentials.json")
+    (.appendChild js/document.body link)
+    (.click link)
+    (.removeChild js/document.body link)
+    (js/URL.revokeObjectURL url)))
+
 (defn- step-number [{:keys [number active? completed?]}]
   [:> Badge
    {:size "1"
@@ -102,50 +118,103 @@
 
 (defn credentials-step []
   (let [credentials @(rf/subscribe [:aws-connect/credentials])
-        error @(rf/subscribe [:aws-connect/error])]
+        error @(rf/subscribe [:aws-connect/error])
+        account-error @(rf/subscribe [:aws-connect/accounts-error])
+        auth-method @(rf/subscribe [:aws-connect/auth-method])]
     [:> Box {:class "space-y-7 max-w-[600px] relative"}
      [loading-screen]
 
      [:> Box
       [:> Box {:class "space-y-3"}
        [:> Heading {:as "h3" :size "4" :weight "bold" :class "text-[--gray-12]"}
-        "IAM User Credentials"]
+        "Authentication Method"]
        [:> Text {:as "p" :size "2" :class "text-[--gray-11]" :mb "5"}
-        "These keys provide secure programmatic access to your AWS environment and will be used only for discovering and managing your selected resources."]]]
+        "Choose how access your AWS resources:"]]]
+
+     ;; Authentication Method Radio Buttons
+     [:> Box {:class "space-y-5 mb-7"}
+      [:> RadioGroup.Root {:size "3"
+                           :value (or auth-method "aws-credentials")
+                           :on-value-change #(rf/dispatch [:aws-connect/set-auth-method %])}
+       [:> Flex {:direction "column" :gap "3"}
+        [:> Flex {:gap "3" :align "start"}
+         [:> RadioGroup.Item {:value "gateway-profile" :id "gateway-profile"}]
+         [:> Box
+          [:> Text {:as "label" :size "3" :weight "medium" :htmlFor "gateway-profile" :class "text-[--gray-12] block"}
+           "Gateway Instance Profile"]
+          [:> Text {:as "p" :size "2" :class "text-[--gray-12]"}
+           "Automatically uses the IAM role attached to the Hoop.dev gateway. No credential entry required - the system handles authentication seamlessly."]]]
+
+        [:> Flex {:gap "3" :align "start"}
+         [:> RadioGroup.Item {:value "aws-credentials" :id "aws-credentials"}]
+         [:> Box
+          [:> Text {:as "label" :size "3" :weight "medium" :htmlFor "aws-credentials" :class "text-[--gray-12] block"}
+           "AWS Credentials"]
+          [:> Text {:as "p" :size "2" :class "text-[--gray-12]"}
+           "Manually provide your AWS access keys and configuration in the fields below. Use this option when specific credentials are needed or when Gateway Instance Profile isn't suitable."]]]]]]
+
+     (when (= auth-method "gateway-profile")
+       [:> Box
+        [:> Box {:class "space-y-3"}
+         [:> Heading {:as "h3" :size "4" :weight "bold" :class "text-[--gray-12]"}
+          "AWS Authentication"]
+         [:> Text {:as "p" :size "2" :class "text-[--gray-11]" :mb "5"}
+          "Please provide the information below to proceed with your AWS authentication."]]])
+
+     (when (= auth-method "aws-credentials")
+       [:> Box
+        [:> Box {:class "space-y-3"}
+         [:> Heading {:as "h3" :size "4" :weight "bold" :class "text-[--gray-12]"}
+          "IAM User Credentials"]
+         [:> Text {:as "p" :size "2" :class "text-[--gray-11]" :mb "5"}
+          "These keys provide secure programmatic access to your AWS environment and will be used only for discovering and managing your selected resources."]]])
 
      ;; IAM User Credentials
      [:> Box {:class "space-y-5"}
-      [forms/input
-       {:placeholder "e.g. AKIAIOSFODNN7EXAMPLE"
-        :label "Access Key ID"
-        :value (get-in credentials [:iam-user :access-key-id])
-        :on-change #(rf/dispatch [:aws-connect/set-iam-user-credentials :access-key-id (-> % .-target .-value)])}]
+      (when (= auth-method "aws-credentials")
+        [:<>
+         [forms/input
+          {:placeholder "e.g. AKIAIOSFODNN7EXAMPLE"
+           :label "Access Key ID"
+           :value (get-in credentials [:iam-user :access-key-id])
+           :on-change #(rf/dispatch [:aws-connect/set-iam-user-credentials :access-key-id (-> % .-target .-value)])}]
 
-      [forms/input
-       {:type "password"
-        :placeholder "e.g. wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-        :label "Secret Access Key"
-        :value (get-in credentials [:iam-user :secret-access-key])
-        :on-change #(rf/dispatch [:aws-connect/set-iam-user-credentials :secret-access-key (-> % .-target .-value)])}]
+         [forms/input
+          {:type "password"
+           :placeholder "e.g. wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+           :label "Secret Access Key"
+           :value (get-in credentials [:iam-user :secret-access-key])
+           :on-change #(rf/dispatch [:aws-connect/set-iam-user-credentials :secret-access-key (-> % .-target .-value)])}]
 
+         [forms/textarea
+          {:label "Session Token (Optional)"
+           :placeholder "e.g. FOoGZXlvYXdzE0z/EaDFQNA2EY59z3tKrAdJB"
+           :value (get-in credentials [:iam-user :session-token])
+           :on-change #(rf/dispatch [:aws-connect/set-iam-user-credentials :session-token (-> % .-target .-value)])}]])
+
+      ;; Region selector (shown for both authentication methods)
       [forms/select
        {:label "Region"
         :full-width? true
         :selected (or (get-in credentials [:iam-user :region]) "")
         :on-change #(rf/dispatch [:aws-connect/set-iam-user-credentials :region %])
-        :options aws-regions}]
+        :options aws-regions}]]
 
-      [forms/textarea
-       {:label "Session Token (Optional)"
-        :placeholder "e.g. FOoGZXlvYXdzE0z/EaDFQNA2EY59z3tKrAdJB"
-        :value (get-in credentials [:iam-user :session-token])
-        :on-change #(rf/dispatch [:aws-connect/set-iam-user-credentials :session-token (-> % .-target .-value)])}]]
+     ;; Security message for both authentication methods
+     [:> Callout.Root {:size "2" :mt "4" :mb "4"}
+      [:> Callout.Icon {:class "self-center"}
+       [:> Info {:size 16}]]
+      [:> Callout.Text
+       (str "Before finishing the setup on the Review and Create step, "
+            "the root passwords for your selected database resources will be automatically "
+            "reset for security purposes. This action can't be undone.")]]
 
-          ;; Error message (if any)
-     (when error
+     ;; Error message (if any)
+     (when (or error account-error)
        [:> Card {:variant "surface" :color "red" :mb "4"}
         [:> Flex {:gap "2" :align "center"}
-         [:> Text {:size "2" :color "red"} error]]])]))
+         [:> Text {:size "2" :color "red"}
+          (or error account-error)]]])]))
 
 (defn accounts-step []
   (r/with-let [accounts (rf/subscribe [:aws-connect/accounts])
@@ -206,11 +275,68 @@
           :sticky-header? true
           :empty-state "No AWS accounts found. Please check your credentials and try again."}]]
 
+       [:> Box {:class "max-w-[600px] space-y-3"}
+        [:> Heading {:as "h3" :size "4" :weight "bold" :class "text-[--gray-12]"}
+         "Additional Configuration"]
+
+        [:> Flex {:align "center" :gap "4" :class "text-[--accent-a11] cursor-pointer"}
+         [:> Switch {:checked @(rf/subscribe [:aws-connect/skip-connected-resources])
+                     :on-checked-change #(rf/dispatch [:aws-connect/toggle-skip-connected-resources %])}]
+
+         [:> Box
+          [:> Text {:as "p" :size "3" :weight "medium" :class "text-[--gray-12]"}
+           "Skip Connected Resources"]
+          [:> Text {:as "p" :size "2" :class "text-[--gray-12]"}
+           "Automatically ignore resources already used in existing connections."]]]]
+
        ;; Error message (if any)
        (when @error
          [:> Card {:variant "surface" :color "red" :mt "4" :class "max-w-[600px]"}
           [:> Flex {:gap "2" :align "center"}
            [:> Text {:size "2" :color "red"} @error]]])])))
+
+(defn skipped-resources-section []
+  (r/with-let [show-skipped (r/atom false)]
+    (let [connected-resources @(rf/subscribe [:aws-connect/connected-resources])
+          skip-enabled? @(rf/subscribe [:aws-connect/skip-connected-resources])]
+      (when (and skip-enabled? (seq connected-resources))
+
+        [:<>
+         [:> Box {:class "max-w-[600px] space-y-3"}
+          [:> Heading {:as "h3" :size "4" :weight "bold" :class "text-[--gray-12]"}
+           "Skipped Resources"]
+          [:> Text {:as "p" :size "2" :class "text-[--gray-11]" :mb "5"}
+           "Additional resources found in already created connections."]
+
+          [:> Button {:variant "soft"
+                      :on-click #(swap! show-skipped not)}
+           (if @show-skipped "Hide" "Show")
+           (if @show-skipped
+             [:> ChevronUp {:size 16}]
+             [:> ChevronDown {:size 16}])]]
+
+         (when @show-skipped
+           [:> Box {:class "w-full"}
+            [data-table-simple
+             {:columns [{:id :name
+                         :header "Resources"
+                         :width "50%"}
+                        {:id :status
+                         :header "Status"
+                         :width "50%"
+                         :render (fn [value _]
+                                   [:> Badge {:color (cond
+                                                       (= value "available") "green"
+                                                       (= value "creating") "blue"
+                                                       :else "gray")
+                                              :variant "soft"}
+                                    value])}]
+              :data (map #(hash-map :id (:arn %)
+                                    :name (:name %)
+                                    :status (:status %))
+                         connected-resources)
+              :key-fn :id
+              :empty-state "No skipped resources found."}]])]))))
 
 (defn resources-step []
   (let [errors @(rf/subscribe [:aws-connect/resources-errors])]
@@ -230,6 +356,8 @@
      [:> Box {:class "w-full"}
       [aws-resources-data-table]]
 
+     [skipped-resources-section]
+
      (when (seq errors)
        [:> Card {:variant "surface" :color "red" :mt "4"}
         [:> Flex {:gap "2" :align "center"}
@@ -239,8 +367,10 @@
                "connected before proceeding to create connections.")]]])]))
 
 (defn create-connection-config []
-  (let [create-connection @(rf/subscribe [:aws-connect/create-connection])]
-    [:> Box {:class "w-full max-w-[600px] space-y-3"}
+  (let [create-connection @(rf/subscribe [:aws-connect/create-connection])
+        enable-secrets-manager @(rf/subscribe [:aws-connect/enable-secrets-manager])
+        secrets-path @(rf/subscribe [:aws-connect/secrets-path])]
+    [:> Box {:class "w-full max-w-[600px] space-y-6"}
      [:> Heading {:as "h3" :size "4" :weight "bold" :class "text-[--gray-12]"}
       "Additional Configuration"]
 
@@ -251,7 +381,33 @@
        [:> Text {:as "p" :size "3" :weight "medium" :class "text-[--gray-12]"}
         "Create Connection"]
        [:> Text {:as "p" :size "2" :class "text-[--gray-12]"}
-        "When enabled, connections will be automatically created after configuring the resources."]]]]))
+        "When enabled, connections will be automatically created after configuring the resources."]]]
+
+     [:> Flex {:align "center" :gap "4" :class "text-[--accent-a11] cursor-pointer" :mt "4"}
+      [:> Switch {:checked enable-secrets-manager
+                  :on-checked-change #(rf/dispatch [:aws-connect/toggle-secrets-manager %])}]
+      [:> Box
+       [:> Text {:as "p" :size "3" :weight "medium" :class "text-[--gray-12]"}
+        "Enable Vault Secrets Provider"]
+       [:> Text {:as "p" :size "2" :class "text-[--gray-12]"}
+        "Integrate with HashiCorp Vault to dynamically expand environment variables in your connections. Currently, only Vault is supported."]
+
+       [:> Box {:my "2"}
+        [:> Link {:href (get-in config/docs-url [:setup :configuration :secrets-manager])
+                  :target "_blank"}
+         [:> Flex {:gap "2" :align "center"}
+          [:> Text {:as "a"
+                    :size "2"}
+           "Learn more about Secrets Manager Configuration"]
+          [:> ArrowUpRight {:size 16}]]]]
+
+       (when enable-secrets-manager
+         [:> Box {:mt "3"}
+          [forms/input
+           {:placeholder "e.g. dbsecrets/data/"
+            :label "Vault Path"
+            :value secrets-path
+            :on-change #(rf/dispatch [:aws-connect/set-secrets-path (-> % .-target .-value)])}]])]]]))
 
 (defn review-step []
   (let [resources @(rf/subscribe [:aws-connect/resources])
@@ -303,6 +459,13 @@
 
      [create-connection-config]
 
+     ;; Error message for missing agent assignments (movido para antes da tabela)
+     (when-let [error @validation-error]
+       [:> Card {:variant "surface" :color "red" :mb "4" :class "max-w-[600px]"}
+        [:> Flex {:gap "2" :align "center"}
+         [:> Text {:size "2" :color "red"}
+          error]]])
+
      [:> Box {:class "w-full"}
       [data-table-simple
        {:columns [{:id :name
@@ -347,8 +510,10 @@
                                    {:selected @agent-id
                                     :not-margin-bottom? true
                                     :style {:width "120px"}
-                                    :on-change #(do (reset! agent-id %)
-                                                    (rf/dispatch [:aws-connect/set-agent-assignment resource-id %]))
+                                    :on-change #(do
+                                                  (reset! validation-error nil)
+                                                  (reset! agent-id %)
+                                                  (rf/dispatch [:aws-connect/set-agent-assignment resource-id %]))
                                     :options (if (seq agents)
                                                (map (fn [agent]
                                                       {:value (:id agent)
@@ -430,6 +595,83 @@
         :sticky-header? true
         :empty-state "No connections are being created"}]]]))
 
+(defn confirmation-dialog [{:keys [open? on-confirm on-cancel]}]
+  [:> AlertDialog.Root
+   {:open open?
+    :on-open-change on-cancel}
+
+   [:> AlertDialog.Content
+    {:class "max-w-[600px]"}
+
+    [:> Heading {:as "h2" :size "5" :mb "3" :weight "bold" :class "text-[--gray-12]"}
+     "Confirm finishing setup?"]
+
+    [:> Text {:as "p" :size "2" :mb "4" :class "text-[--gray-11]"}
+     "Completing this setup will automatically reset the root passwords for your selected database resources. These new credentials will be securely stored and accessible only through Hoop.dev."]
+
+    [:> Text {:as "p" :size "2" :mb "5" :class "text-[--gray-11]"}
+     "Do you want to proceed and confirm finishing this setup?"]
+
+    [:> Flex {:justify "end" :gap "3" :mt "4"}
+     [:> AlertDialog.Cancel {:asChild true}
+      [:> Button {:variant "soft" :color "gray" :on-click on-cancel}
+       "Cancel"]]
+     [:> AlertDialog.Action {:asChild true}
+      [:> Button {:variant "solid" :color "red" :on-click on-confirm}
+       "Confirm and Reset Password"]]]]])
+
+(defn password-reset-modal []
+  (let [modal-open? @(rf/subscribe [:aws-connect/password-reset-modal-open?])
+        credentials @(rf/subscribe [:aws-connect/password-reset-credentials])
+        user-confirmed? @(rf/subscribe [:aws-connect/password-reset-user-confirmed?])]
+    [:> AlertDialog.Root
+     {:open modal-open?}
+
+     [:> AlertDialog.Content
+      {:class "max-w-[400px]"
+       :on-escape-key-down #(.preventDefault %)
+       :on-pointer-down-outside #(.preventDefault %)}
+
+      [:> Box {:class "space-y-radix-5" :mb "4"}
+       [:> Heading {:as "h2" :size "6" :mb "3" :weight "bold" :class "text-[--gray-12]"}
+        "Save your new root passwords"]
+
+       [:> Text {:as "p" :size "2" :mb "4" :class "text-[--gray-12]"}
+        "The following file provides your new resources root passwords with full administrative access."]
+
+       [:> Box
+        [:> Text {:as "p" :size "2" :weight "medium" :class "text-[--gray-12]"}
+         "Please:"]
+        [:ol {:class "list-decimal list-inside space-y-1 text-sm text-[--gray-12]"}
+         [:li "Save this file immediately"]
+         [:li "Store all information in a secure password manager"]
+         [:li "Do not share via email or any unsecured channel"]]]
+
+       [:> Box
+        [:> Text {:as "p" :size "2" :weight "medium" :mb "2" :class "text-[--gray-12]"} "Resources new root passwords:"]
+        [:> Button {:variant "soft"
+                    :on-click #(download-credentials-file credentials)}
+         "Download File"
+         [:> Download {:size 16}]]]
+
+       [:> Box
+        [:> Text {:size "2" :weight "medium" :class "text-[--gray-12]"}
+         "Note: "]
+        [:> Text {:size "2" :class "text-[--gray-12]"}
+         "These passwords will NEVER be shown again. There is no way to retrieve it after leaving this page."]]]
+
+      [:> Flex {:align "center" :gap "2" :mb "4"}
+       [:> Checkbox {:checked user-confirmed?
+                     :on-checked-change #(rf/dispatch [:aws-connect/set-password-confirmation %])}]
+       [:> Text {:as "span" :size "2" :class "text-[--gray-12]"}
+        "I confirm that I have securely saved this password"]]
+
+      [:> Flex {:justify "end" :gap "3" :mt "4"}
+       [:> Button {:variant "solid"
+                   :disabled (not user-confirmed?)
+                   :on-click #(rf/dispatch [:aws-connect/finish-password-reset])}
+        "Confirm and Finish"]]]]))
+
 (defn aws-connect-header []
   [:<>
    [:> Box
@@ -444,82 +686,107 @@
 (defn main []
   (rf/dispatch [:aws-connect/fetch-agents])
 
-  (fn [form-type]
-    (let [current-step @(rf/subscribe [:aws-connect/current-step])
-          loading @(rf/subscribe [:aws-connect/loading])]
+  (r/with-let [show-confirm-dialog (r/atom false)]
+    (fn [form-type]
+      (let [current-step @(rf/subscribe [:aws-connect/current-step])
+            loading @(rf/subscribe [:aws-connect/loading])
+            agent-assignments @(rf/subscribe [:aws-connect/agent-assignments])
+            selected-resources @(rf/subscribe [:aws-connect/selected-resources])
 
-      [page-wrapper/main
-       {:children
-        [:> Box {:class "min-h-screen bg-gray-1"}
-         [:> Box {:class "mx-auto max-w-[1000px] p-6 space-y-7"}
-          [:> Box {:class "place-items-center space-y-7"}
-           [aws-connect-header]
-           [:> Flex {:align "center" :justify "center" :mb "8" :class "w-full"}
-            (for [{:keys [id number title]} (if (= current-step :creation-status)
-                                              steps
-                                              (take 3 steps))]
-              ^{:key id}
-              [:> Flex {:align "center"}
-               [:> Flex {:align "center" :gap "1"}
-                [step-number {:number number
-                              :active? (= id current-step)
-                              :completed? (> (.indexOf [:credentials :accounts :resources :review :creation-status] current-step)
-                                             (.indexOf [:credentials :accounts :resources :review :creation-status] id))}]
-                [step-title {:title title
-                             :active? (= id current-step)
-                             :completed? (> (.indexOf [:credentials :accounts :resources :review :creation-status] current-step)
-                                            (.indexOf [:credentials :accounts :resources :review :creation-status] id))}]
-                (when (> (.indexOf [:credentials :accounts :resources :review :creation-status] current-step)
-                         (.indexOf [:credentials :accounts :resources :review :creation-status] id))
-                  [step-checkmark])]
-               (when-not (= id (if (= current-step :creation-status) :creation-status :review))
-                 [:> Box {:class "px-2"}
-                  [:> Separator {:size "1" :orientation "horizontal" :class "w-4"}]])])]
-      ;; Current step content
-           (case current-step
-             :credentials [credentials-step]
-             :accounts [accounts-step]
-             :resources [resources-step]
-             :review [review-step]
-             :creation-status [creation-status-step]
-             [credentials-step])]]]
-        :footer-props
-        {:form-type form-type
-         :back-text (case current-step
-                      :credentials "Back"
-                      :accounts "Back to Credentials"
-                      :resources "Back to Accounts"
-                      :review "Back to Resources"
-                      :creation-status nil)
-         :next-text (case current-step
-                      :credentials "Next: Accounts"
-                      :accounts "Next: Resources"
-                      :resources "Next: Review"
-                      :review "Confirm and Create"
-                      :creation-status "Go to AWS Connect")
-         :on-back #(case current-step
-                     :credentials (.back js/history)
-                     :accounts (rf/dispatch [:aws-connect/set-current-step :credentials])
-                     :resources (rf/dispatch [:aws-connect/set-current-step :accounts])
-                     :review (rf/dispatch [:aws-connect/set-current-step :resources])
-                     :creation-status nil)
-         :on-next #(case current-step
-                     :credentials (rf/dispatch [:aws-connect/validate-credentials])
-                     :accounts (rf/dispatch [:aws-connect/fetch-rds-instances])
-                     :resources (rf/dispatch [:aws-connect/set-current-step :review])
-                     :review (rf/dispatch [:aws-connect/create-connections])
-                     :creation-status (rf/dispatch [:navigate :integrations-aws-connect]))
-         :back-hidden? (case current-step
-                         :credentials false
-                         :accounts false
-                         :resources false
-                         :review false
-                         :creation-status true)
-         :next-disabled? (case current-step
-                           :credentials (:active? loading)
-                           :accounts (empty? @(rf/subscribe [:aws-connect/selected-accounts]))
-                           :resources (empty? @(rf/subscribe [:aws-connect/selected-resources]))
-                           :review (some empty? (vals @(rf/subscribe [:aws-connect/agent-assignments])))
-                           :creation-status false)}}])))
+            validate-agents (fn []
+                              (if (and (= current-step :review)
+                                       (some #(empty? (get agent-assignments % "")) selected-resources))
+                                (do
+                                  (reset! validation-error "Please assign an agent to all selected resources before proceeding.")
+                                  false)
+                                (do
+                                  (reset! validation-error nil)
+                                  true)))
 
+            handle-next-click (fn []
+                                (case current-step
+                                  :credentials (rf/dispatch [:aws-connect/validate-credentials])
+                                  :accounts (rf/dispatch [:aws-connect/fetch-rds-instances])
+                                  :resources (rf/dispatch [:aws-connect/set-current-step :review])
+                                  :review (when (validate-agents)
+                                            (reset! show-confirm-dialog true))
+                                  :creation-status (rf/dispatch [:navigate :integrations-aws-connect])))]
 
+        [page-wrapper/main
+         {:children
+          [:> Box {:class "min-h-screen bg-gray-1"}
+
+           [confirmation-dialog
+            {:open? @show-confirm-dialog
+             :on-confirm #(do
+                            (reset! show-confirm-dialog false)
+                            (rf/dispatch [:aws-connect/reset-root-passwords]))
+             :on-cancel #(reset! show-confirm-dialog false)}]
+
+           [password-reset-modal]
+
+           [:> Box {:class "mx-auto max-w-[1000px] p-6 space-y-7"}
+            [:> Box {:class "place-items-center space-y-7"}
+             [aws-connect-header]
+             [:> Flex {:align "center" :justify "center" :mb "8" :class "w-full"}
+              (for [{:keys [id number title]} (if (= current-step :creation-status)
+                                                steps
+                                                (take 3 steps))]
+                ^{:key id}
+                [:> Flex {:align "center"}
+                 [:> Flex {:align "center" :gap "1"}
+                  [step-number {:number number
+                                :active? (= id current-step)
+                                :completed? (> (.indexOf [:credentials :accounts :resources :review :creation-status] current-step)
+                                               (.indexOf [:credentials :accounts :resources :review :creation-status] id))}]
+                  [step-title {:title title
+                               :active? (= id current-step)
+                               :completed? (> (.indexOf [:credentials :accounts :resources :review :creation-status] current-step)
+                                              (.indexOf [:credentials :accounts :resources :review :creation-status] id))}]
+                  (when (> (.indexOf [:credentials :accounts :resources :review :creation-status] current-step)
+                           (.indexOf [:credentials :accounts :resources :review :creation-status] id))
+                    [step-checkmark])]
+                 (when-not (= id (if (= current-step :creation-status) :creation-status :review))
+                   [:> Box {:class "px-2"}
+                    [:> Separator {:size "1" :orientation "horizontal" :class "w-4"}]])])]
+             ;; Current step content
+             (case current-step
+               :credentials [credentials-step]
+               :accounts [accounts-step]
+               :resources [resources-step]
+               :review [review-step]
+               :creation-status [creation-status-step]
+               [credentials-step])]]]
+          :footer-props
+          {:form-type form-type
+           :back-text (case current-step
+                        :credentials "Back"
+                        :accounts "Back to Credentials"
+                        :resources "Back to Accounts"
+                        :review "Back to Resources"
+                        :creation-status nil)
+           :next-text (case current-step
+                        :credentials "Next: Accounts"
+                        :accounts "Next: Resources"
+                        :resources "Next: Review"
+                        :review "Confirm and Reset Password"
+                        :creation-status "Go to AWS Connect")
+           :on-back #(case current-step
+                       :credentials (.back js/history)
+                       :accounts (rf/dispatch [:aws-connect/set-current-step :credentials])
+                       :resources (rf/dispatch [:aws-connect/set-current-step :accounts])
+                       :review (rf/dispatch [:aws-connect/set-current-step :resources])
+                       :creation-status nil)
+           :on-next handle-next-click
+           :back-hidden? (case current-step
+                           :credentials false
+                           :accounts false
+                           :resources false
+                           :review false
+                           :creation-status true)
+           :next-disabled? (case current-step
+                             :credentials (:active? loading)
+                             :accounts (empty? @(rf/subscribe [:aws-connect/selected-accounts]))
+                             :resources (empty? @(rf/subscribe [:aws-connect/selected-resources]))
+                             :review false
+                             :creation-status false)}}]))))

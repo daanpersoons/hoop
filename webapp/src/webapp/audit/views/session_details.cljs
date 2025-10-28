@@ -62,13 +62,24 @@
 (defmulti ^:private session-event-stream identity)
 (defmethod ^:private session-event-stream "command-line"
   [_ session]
-  (let [event-stream (:event_stream session)]
-    [session-data-video/main event-stream]))
+  (let [event-stream (:event_stream session)
+        session-id (:id session)
+        start-date (:start_date session)]
+    [session-data-video/main event-stream session-id start-date]))
+
+(defmethod ^:private session-event-stream "application"
+  [_ session]
+  (let [event-stream (:event_stream session)
+        session-id (:id session)
+        start-date (:start_date session)]
+    [session-data-video/main event-stream session-id start-date]))
 
 (defmethod ^:private session-event-stream "custom"
   [_ session]
-  (let [event-stream (:event_stream session)]
-    [session-data-video/main event-stream]))
+  (let [event-stream (:event_stream session)
+        session-id (:id session)
+        start-date (:start_date session)]
+    [session-data-video/main event-stream session-id start-date]))
 
 (defmethod ^:private session-event-stream :default
   [_ session]
@@ -207,62 +218,62 @@
         executing-status (r/atom :ready)
         connecting-status (r/atom :ready)
         killing-status (r/atom :ready)
-        add-review-popover-open? (r/atom false)
-        clipboard-url (new clipboardjs ".copy-to-clipboard-url")]
+        add-review-popover-open? (r/atom false)]
     (rf/dispatch [:gateway->get-info])
     (when session
       (rf/dispatch [:audit->get-session-by-id session]))
     (fn []
-      (let [session (:session @session-details)
-            user (:data @user-details)
-            session-user-name (:user_name session)
-            session-user-id (:user_id session)
-            current-user-id (:id user)
-            connection-name (:connection session)
-            start-date (:start_date session)
-            end-date (:end_date session)
-            verb (:verb session)
-            session-status (:status session)
-            has-large-payload? (:has-large-payload? @session-details)
-            disabled-download (-> @gateway-info :data :disable_sessions_download)
-            review-groups (-> session :review :review_groups_data)
-            in-progress? (or (= end-date nil)
-                             (= end-date ""))
-            has-review? (boolean (seq (-> session :review)))
-            review-status (when has-review?
-                            (some #(when (= (:status %) "APPROVED") "APPROVED") review-groups))
-            can-kill-session? (and (= session-status "open")
-                                   (or (not has-review?)
-                                       (= review-status "APPROVED")))
-            has-session-report? (seq (-> @session-report :data :items))
-            ready? (= (:status session) "ready")
-            revoke-at (when (get-in session [:review :revoke_at])
-                        (js/Date. (get-in session [:review :revoke_at])))
-            not-revoked? (when revoke-at (> (.getTime revoke-at) (.getTime (js/Date.))))
-            can-connect? (and ready? (= verb "connect") not-revoked?)
-            can-review? (and
-                         (some #(= "PENDING" (:status %))
-                               review-groups)
-                         (some (fn [review-group]
-                                 (some #(= (:group review-group) %)
-                                       (-> user :data :groups)))
-                               review-groups))
-            is-session-owner? (= session-user-id current-user-id)
-            add-review-cb (fn [status]
-                            (rf/dispatch [:audit->add-review
-                                          session
-                                          status])
-                            (reset! add-review-popover-open? false))
-            script-data (-> session :script :data)
-            metadata (-> session :metadata)
-            runbook-params (js->clj
-                            (js/JSON.parse (-> session :labels :runbookParameters))
-                            :keywordize-keys true)
-            kill-session (fn []
-                           (reset! killing-status :loading)
-                           (rf/dispatch [:audit->kill-session session killing-status]))
-            _ (.on clipboard-url "success" #(rf/dispatch [:show-snackbar {:level :success :text "URL copied to clipboard"}]))]
-        (r/with-let []
+      (r/with-let [clipboard-url (new clipboardjs ".copy-to-clipboard-url")
+                   _ (.on clipboard-url "success" #(rf/dispatch [:show-snackbar {:level :success :text "URL copied to clipboard"}]))]
+        (let [session (:session @session-details)
+              user (:data @user-details)
+              session-user-name (:user_name session)
+              session-user-id (:user_id session)
+              current-user-id (:id user)
+              connection-name (:connection session)
+              connection-subtype (:connection_subtype session)
+              start-date (:start_date session)
+              end-date (:end_date session)
+              verb (:verb session)
+              session-status (:status session)
+              has-large-payload? (:has-large-payload? @session-details)
+              disabled-download (-> @gateway-info :data :disable_sessions_download)
+              review-groups (-> session :review :review_groups_data)
+              in-progress? (or (= end-date nil)
+                               (= end-date ""))
+              has-review? (boolean (seq (-> session :review)))
+              review-status (when has-review?
+                              (some #(when (= (:status %) "APPROVED") "APPROVED") review-groups))
+              can-kill-session? (and (= session-status "open")
+                                     (or (not has-review?)
+                                         (= review-status "APPROVED")))
+              has-session-report? (seq (-> @session-report :data :items))
+              ready? (= (:status session) "ready")
+              revoke-at (when (get-in session [:review :revoke_at])
+                          (js/Date. (get-in session [:review :revoke_at])))
+              not-revoked? (when revoke-at (> (.getTime revoke-at) (.getTime (js/Date.))))
+              can-connect? (and ready? (= verb "connect") not-revoked?)
+              can-review? (and
+                           (some #(= "PENDING" (:status %))
+                                 review-groups)
+                           (some (fn [review-group]
+                                   (some #(= (:group review-group) %)
+                                         (-> user :groups)))
+                                 review-groups))
+              is-session-owner? (= session-user-id current-user-id)
+              add-review-cb (fn [status]
+                              (rf/dispatch [:audit->add-review
+                                            session
+                                            status])
+                              (reset! add-review-popover-open? false))
+              script-data (-> session :script :data)
+              metadata (-> session :metadata)
+              runbook-params (js->clj
+                              (js/JSON.parse (-> session :labels :runbookParameters))
+                              :keywordize-keys true)
+              kill-session (fn []
+                             (reset! killing-status :loading)
+                             (rf/dispatch [:audit->kill-session session killing-status]))]
           [:div
            [:header {:class "mb-regular mr-large"}
             [:div {:class "flex"}
@@ -315,7 +326,8 @@
                      [loaders/simple-loader {:size 2}]
                      [:> hero-outline-icon/StopIcon {:class "h-5 w-5 text-red-600"}])]]])
 
-              (when (= (:verb session) "exec")
+              (when (and (= (:verb session) "exec")
+                         (nil? (-> session :integrations_metadata :jira_issue_url)))
                 [:div {:class "relative group"}
                  [:> Tooltip {:content "Re-run session"}
                   [:div {:class "rounded-full p-2 bg-gray-100 hover:bg-gray-200 transition cursor-pointer"
@@ -420,7 +432,7 @@
                  ^{:key (:id group)}
                  [review-group-item group session user]))]]]
 
-         ;; runbook params
+           ;; runbook params
            (when (and runbook-params
                       (seq runbook-params))
              [:div {:class "flex gap-regular items-center mb-regular py-small border-b border-t"}
@@ -434,9 +446,9 @@
                    [:span {:class "font-bold text-gray-500"}
                     param-key ": "]
                    [:span param-value]]))]])
-         ;; end runbook params
+           ;; end runbook params
 
-         ;; metadata
+           ;; metadata
            (when (and metadata
                       (seq metadata))
              [:div {:class " mb-regular"}
@@ -453,9 +465,9 @@
                           :class "text-blue-600 underline"}
                       metadata-value]
                      [:span metadata-value])]]))])
-         ;; end metadata
+           ;; end metadata
 
-         ;; script area
+           ;; script area
            (when (and script-data
                       (> (count script-data) 0))
              [:section {:id "session-script"}
@@ -464,23 +476,22 @@
                             "rounded-lg bg-gray-100 "
                             "text-xs text-gray-800 font-mono")}
                [:article script-data]]])
-         ;; end script area
+           ;; end script area
 
-         ;; data masking analytics
+           ;; data masking analytics
            (when-not (or has-review?
                          (= :loading (:status @session-report))
                          (not has-session-report?))
              [:div {:class "mt-6"}
               [data-masking-analytics @session-report]])
-         ;; end data masking analytics
+           ;; end data masking analytics
 
            [:section {:id "session-event-stream"
-                      :class "pt-regular"}
+                      :class "pt-regular max-h-[700px]"}
             (if (= (:status @session-details) :loading)
               [loading-player]
 
-              [:section {:id "session-event-stream"
-                         :class "pt-regular"}
+              [:<>
                (if has-large-payload?
                  [large-payload-warning
                   {:session session}]
@@ -488,15 +499,16 @@
                  [:div {:class "h-full px-small"}
                   (if (= (:verb session) "exec")
                     [results-container/main
-                     connection-name
+                     connection-subtype
                      {:results (utilities/decode-b64 (or (first (:event_stream session)) ""))
                       :results-status (:status @session-details)
                       :fixed-height? true
                       :results-id (:id session)
                       :not-clipboard? disabled-download}]
-                    [session-event-stream (:type session) session])])])]]
+                    [session-event-stream (:type session) session])])])]])
 
-          (finally
-            (rf/dispatch [:audit->clear-session])
-            (rf/dispatch [:reports->clear-session-report-by-id])))))))
+        (finally
+          (.destroy clipboard-url)
+          (rf/dispatch [:audit->clear-session])
+          (rf/dispatch [:reports->clear-session-report-by-id]))))))
 

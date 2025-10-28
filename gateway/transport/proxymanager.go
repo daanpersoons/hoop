@@ -15,9 +15,8 @@ import (
 	pbclient "github.com/hoophq/hoop/common/proto/client"
 	pbgateway "github.com/hoophq/hoop/common/proto/gateway"
 	"github.com/hoophq/hoop/gateway/analytics"
-	apiconnections "github.com/hoophq/hoop/gateway/api/connections"
+	"github.com/hoophq/hoop/gateway/models"
 	"github.com/hoophq/hoop/gateway/storagev2/clientstate"
-	"github.com/hoophq/hoop/gateway/storagev2/types"
 	plugintypes "github.com/hoophq/hoop/gateway/transport/plugins/types"
 	"github.com/hoophq/hoop/gateway/transport/streamclient"
 	"google.golang.org/grpc/codes"
@@ -46,7 +45,7 @@ func (s *Server) proxyManager(stream *streamclient.ProxyStream) error {
 
 	defer func() {
 		_ = stream.Close(err)
-		_, _ = clientstate.Update(pluginCtx, types.ClientStatusDisconnected)
+		_, _ = clientstate.Update(pluginCtx, models.ProxyManagerStatusDisconnected)
 		stateID := clientstate.DeterministicClientUUID(pluginCtx.GetUserID())
 		if len(stateID) > 0 {
 			removeDispatcherState(stateID)
@@ -56,7 +55,6 @@ func (s *Server) proxyManager(stream *streamclient.ProxyStream) error {
 	case *plugintypes.InternalError:
 		if v.HasInternalErr() {
 			log.Errorf("plugin rejected packet, %v", v.FullErr())
-			sentry.CaptureException(fmt.Errorf(v.FullErr()))
 		}
 		return status.Errorf(codes.Internal, err.Error())
 	}
@@ -65,7 +63,7 @@ func (s *Server) proxyManager(stream *streamclient.ProxyStream) error {
 
 func (s *Server) listenProxyManagerMessages(stream *streamclient.ProxyStream) error {
 	pctx := stream.PluginContext()
-	recvCh := grpc.NewStreamRecv(stream)
+	recvCh := grpc.NewStreamRecv(stream.Context(), stream)
 	for {
 		var dstream *grpc.DataStream
 		select {
@@ -123,7 +121,7 @@ func (s *Server) listenProxyManagerMessages(stream *streamclient.ProxyStream) er
 
 func (s *Server) proccessConnectOKAck(stream *streamclient.ProxyStream) error {
 	pctx := stream.PluginContext()
-	newClient, err := clientstate.Update(pctx, types.ClientStatusReady,
+	newClient, err := clientstate.Update(pctx, models.ProxyManagerStatusReady,
 		clientstate.WithOption("session", pctx.SID),
 		clientstate.WithOption("version", stream.GetMeta("version")),
 		clientstate.WithOption("go-version", stream.GetMeta("go-version")),
@@ -131,7 +129,7 @@ func (s *Server) proccessConnectOKAck(stream *streamclient.ProxyStream) error {
 		clientstate.WithOption("hostname", stream.GetMeta("hostname")),
 	)
 	if err != nil {
-		log.Errorf("failed client state to database, err=%v", err)
+		log.Errorf("failed updating proxy manager state, reason=%v", err)
 		return err
 	}
 
@@ -150,7 +148,7 @@ func (s *Server) proccessConnectOKAck(stream *streamclient.ProxyStream) error {
 		return stream.ContextCauseError()
 	case req := <-disp.requestCh:
 		log.With("session", pctx.SID).Infof("starting connect phase for %s", req.RequestConnectionName)
-		conn, err := apiconnections.FetchByName(pctx, req.RequestConnectionName)
+		conn, err := models.GetConnectionByNameOrID(pctx, req.RequestConnectionName)
 		if err != nil {
 			log.Errorf("failed retrieving connection, reason=%v", err)
 			disp.sendResponse(nil, err)
@@ -198,13 +196,12 @@ func (s *Server) proccessConnectOKAck(stream *streamclient.ProxyStream) error {
 		userAgent := apiutils.NormalizeUserAgent(func(key string) []string {
 			return []string{stream.GetMeta("user-agent")}
 		})
-		analytics.New().Track(pctx.UserEmail, analytics.EventGrpcConnect, map[string]any{
+		analytics.New().Track(pctx.UserID, analytics.EventGrpcConnect, map[string]any{
 			"connection-name":    req.RequestConnectionName,
 			"connection-type":    conn.Type,
 			"connection-subtype": conn.SubType,
 			"client-version":     stream.GetMeta("version"),
 			"platform":           stream.GetMeta("platform"),
-			"hostname":           stream.GetMeta("hostname"),
 			"user-agent":         userAgent,
 			"origin":             clientOrigin,
 			"verb":               pb.ClientVerbConnect,
@@ -214,7 +211,7 @@ func (s *Server) proccessConnectOKAck(stream *streamclient.ProxyStream) error {
 		onOpenSessionPkt := &pb.Packet{
 			Type: pbagent.SessionOpen,
 			Spec: map[string][]byte{
-				pb.SpecJitTimeout:        []byte(req.RequestAccessDuration.String()),
+				pb.SpecJitTimeout:        fmt.Appendf(nil, "%vs", req.RequestAccessDurationSec),
 				pb.SpecGatewaySessionID:  []byte(pctx.SID),
 				pb.SpecClientRequestPort: []byte(req.RequestPort),
 			},

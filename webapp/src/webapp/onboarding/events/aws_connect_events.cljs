@@ -9,6 +9,7 @@
                                 :loading {:active? false
                                           :message nil}
                                 :error nil
+                                :auth-method "aws-credentials"
                                 :credentials nil
                                 :accounts {:data nil
                                            :status nil
@@ -19,10 +20,18 @@
                                             :errors nil
                                             :status nil
                                             :connection-names {}
-                                            :security-groups {}}
+                                            :security-groups {}
+                                            :connected []}
                                 :agents {:data nil
                                          :assignments nil}
-                                :create-connection true})
+                                :create-connection true
+                                :enable-secrets-manager false
+                                :secrets-path ""
+                                :skip-connected-resources true
+                                :password-reset {:loading? false
+                                                 :credentials nil
+                                                 :modal-open? false
+                                                 :user-confirmed? false}})
     :dispatch [:aws-connect/fetch-agents]}))
 
 (rf/reg-event-db
@@ -55,11 +64,16 @@
 (rf/reg-event-fx
  :aws-connect/validate-credentials
  (fn [{:keys [db]} _]
-   (let [credentials (get-in db [:aws-connect :credentials])
-         aws-credentials {:access_key_id (get-in credentials [:iam-user :access-key-id])
-                          :secret_access_key (get-in credentials [:iam-user :secret-access-key])
-                          :region (get-in credentials [:iam-user :region])
-                          :session_token (get-in credentials [:iam-user :session-token])}]
+   (let [auth-method (get-in db [:aws-connect :auth-method])
+         credentials (get-in db [:aws-connect :credentials])
+         aws-credentials (if (= auth-method "gateway-profile")
+                           ;; Gateway profile só precisa da região
+                           {:region (get-in credentials [:iam-user :region])}
+                           ;; Credenciais completas
+                           {:access_key_id (get-in credentials [:iam-user :access-key-id])
+                            :secret_access_key (get-in credentials [:iam-user :secret-access-key])
+                            :region (get-in credentials [:iam-user :region])
+                            :session_token (get-in credentials [:iam-user :session-token])})]
      {:db (-> db
               (assoc-in [:aws-connect :status] :validating)
               (assoc-in [:aws-connect :loading :active?] true)
@@ -93,7 +107,8 @@
             (assoc-in [:aws-connect :loading :message] nil)
             (assoc-in [:aws-connect :error] (or response "Failed to save AWS credentials")))
     :dispatch [:show-snackbar {:level :error
-                               :text "Failed to save AWS credentials. Please check your inputs and try again."}]}))
+                               :text "Failed to save AWS credentials"
+                               :details response}]}))
 
 
 (rf/reg-event-fx
@@ -116,12 +131,20 @@
    (let [rds-instances (get response :items [])
          accounts (get-in db [:aws-connect :accounts :data] [])
 
+         resources-by-connection (group-by #(if (seq (:connection_resources %)) :connected :not-connected) rds-instances)
+         connected-resources (get resources-by-connection :connected [])
+         resources-without-connections (get resources-by-connection :not-connected [])
+
+         connected-resources (filter #(nil? (:error %)) connected-resources)
+
          ;; Group resources by account_id for hierarchical structure
          resources-by-account (reduce (fn [acc instance]
                                         (let [account-id (:account_id instance)]
                                           (update acc account-id (fnil conj []) instance)))
                                       {}
-                                      rds-instances)
+                                      (if (get-in db [:aws-connect :skip-connected-resources] true)
+                                        resources-without-connections
+                                        rds-instances))
 
          ;; Format resources
          formatted-resources (mapv (fn [account]
@@ -154,15 +177,20 @@
                                         :error error
                                         :children (when-not error
                                                     formatted-children)}))
-                                   accounts)]
+                                   accounts)
+
+         filtered-resources (if (get-in db [:aws-connect :skip-connected-resources] true)
+                              (filterv #(or (:error %) (seq (:children %))) formatted-resources)
+                              formatted-resources)]
 
      {:db (-> db
               (assoc-in [:aws-connect :status] :credentials-valid)
               (assoc-in [:aws-connect :loading :active?] false)
               (assoc-in [:aws-connect :loading :message] nil)
-              (assoc-in [:aws-connect :resources :data] formatted-resources)
+              (assoc-in [:aws-connect :resources :data] filtered-resources)
               (assoc-in [:aws-connect :resources :status] :loaded)
-              (assoc-in [:aws-connect :resources :api-error] nil))
+              (assoc-in [:aws-connect :resources :api-error] nil)
+              (assoc-in [:aws-connect :resources :connected] connected-resources))
       :dispatch [:aws-connect/set-current-step :resources]})))
 
 (rf/reg-event-fx
@@ -180,7 +208,8 @@
               (assoc-in [:aws-connect :resources :data] [])
               (assoc-in [:aws-connect :resources :api-error] api-error))
       :dispatch [:show-snackbar {:level :error
-                                 :text "Failed to retrieve database instances from AWS. Please check your credentials and try again."}]})))
+                                 :text "Failed to retrieve AWS database instances"
+                                 :details response}]})))
 
 (rf/reg-event-fx
  :aws-connect/create-connections
@@ -228,22 +257,30 @@
    (let [total-resources (count resources)
          create-connection (get-in db [:aws-connect :create-connection] true)
          job-steps (if create-connection ["create-connections" "send-webhook"] ["send-webhook"])
+         enable-secrets-manager (get-in db [:aws-connect :enable-secrets-manager] false)
+         secrets-path (get-in db [:aws-connect :secrets-path] "")
+
          dispatch-requests (for [resource resources
                                  :let [agent-id (get agent-assignments (:id resource) "default")
                                        resource-arn (:id resource)
                                        security-group (get security-groups (:id resource) "")
                                        connection-prefix (or (get connection-names (:id resource))
-                                                             (str (:name resource) "-" (:account-id resource)))]]
+                                                             (str (:name resource) "-" (:account-id resource)))
+                                       payload {:agent_id agent-id
+                                                :aws {:instance_arn resource-arn
+                                                      :default_security_group (if (empty? security-group)
+                                                                                nil
+                                                                                {:ingress_cidr security-group})}
+                                                :connection_prefix_name (str connection-prefix "-")
+                                                :job_steps job-steps}
+                                       ;; Add vault provider to payload if enabled
+                                       final-payload (if (and enable-secrets-manager (not (empty? secrets-path)))
+                                                       (assoc payload :vault_provider {:secret_id secrets-path})
+                                                       payload)]]
                              [:fetch
                               {:method "POST"
                                :uri "/dbroles/jobs"
-                               :body {:agent_id agent-id
-                                      :aws {:instance_arn resource-arn
-                                            :default_security_group (if (empty? security-group)
-                                                                      nil
-                                                                      {:ingress_cidr security-group})}
-                                      :connection_prefix_name (str connection-prefix "-")
-                                      :job_steps job-steps}
+                               :body final-payload
                                :on-success #(rf/dispatch [:aws-connect/connection-created-success % resource])
                                :on-failure #(rf/dispatch [:aws-connect/connection-created-failure % resource])}])]
      {:db (assoc-in db [:aws-connect :resources :total-to-process] total-resources)
@@ -251,9 +288,8 @@
 
 (rf/reg-event-fx
  :aws-connect/connection-created-success
- (fn [{:keys [db]} [_ response resource]]
+ (fn [{:keys [db]} [_ _ resource]]
    (let [resource-id (:id resource)
-         connection-name (get-in db [:aws-connect :creation-status :connections resource-id :name])
          updated-db (-> db
                         (assoc-in [:aws-connect :creation-status :connections resource-id :status] "success")
                         (assoc-in [:aws-connect :creation-status :connections resource-id :error] nil))
@@ -265,13 +301,12 @@
      {:db (-> updated-db
               (assoc-in [:aws-connect :creation-status :all-completed?] all-completed?))
       :dispatch [:show-snackbar {:level :success
-                                 :text (str "Connection " connection-name " created successfully!")}]})))
+                                 :text "AWS connection created successfully!"}]})))
 
 (rf/reg-event-fx
  :aws-connect/connection-created-failure
  (fn [{:keys [db]} [_ response resource]]
    (let [resource-id (:id resource)
-         connection-name (get-in db [:aws-connect :creation-status :connections resource-id :name])
          error-message (or response
                            "Failed to create connection")
 
@@ -286,7 +321,8 @@
      {:db (-> updated-db
               (assoc-in [:aws-connect :creation-status :all-completed?] all-completed?))
       :dispatch [:show-snackbar {:level :error
-                                 :text (str "Failed to create connection " connection-name)}]})))
+                                 :text "Failed to create AWS connection"
+                                 :details response}]})))
 
 ;; New events for fetching AWS accounts
 (rf/reg-event-fx
@@ -322,9 +358,7 @@
               (assoc-in [:aws-connect :accounts :status] :error)
               (assoc-in [:aws-connect :accounts :api-error] api-error)
               (assoc-in [:aws-connect :loading :active?] false)
-              (assoc-in [:aws-connect :loading :message] nil))
-      :dispatch [:show-snackbar {:level :error
-                                 :text "Failed to retrieve AWS accounts. Please check your credentials and try again."}]})))
+              (assoc-in [:aws-connect :loading :message] nil))})))
 
 ;; Set the selected accounts
 (rf/reg-event-db
@@ -399,7 +433,8 @@
  (fn [{:keys [db]} [_ response]]
    {:db (assoc-in db [:aws-connect :agents :data] [])
     :dispatch [:show-snackbar {:level :error
-                               :text "Failed to load agents. Using default options."}]}))
+                               :text "Failed to load agents"
+                               :details response}]}))
 
 (rf/reg-sub
  :aws-connect/resources-api-error
@@ -461,3 +496,115 @@
  :aws-connect/accounts-error
  (fn [db _]
    (get-in db [:aws-connect :accounts :api-error :message])))
+
+;; New events and subscriptions for Secrets Manager
+(rf/reg-event-db
+ :aws-connect/toggle-secrets-manager
+ (fn [db [_ value]]
+   (assoc-in db [:aws-connect :enable-secrets-manager] value)))
+
+(rf/reg-event-db
+ :aws-connect/set-secrets-path
+ (fn [db [_ path]]
+   (assoc-in db [:aws-connect :secrets-path] path)))
+
+(rf/reg-sub
+ :aws-connect/enable-secrets-manager
+ (fn [db _]
+   (get-in db [:aws-connect :enable-secrets-manager] false)))
+
+(rf/reg-sub
+ :aws-connect/secrets-path
+ (fn [db _]
+   (get-in db [:aws-connect :secrets-path] "")))
+
+(rf/reg-event-db
+ :aws-connect/set-auth-method
+ (fn [db [_ method]]
+   (assoc-in db [:aws-connect :auth-method] method)))
+
+(rf/reg-sub
+ :aws-connect/auth-method
+ (fn [db _]
+   (get-in db [:aws-connect :auth-method])))
+
+(rf/reg-event-db
+ :aws-connect/toggle-skip-connected-resources
+ (fn [db [_ value]]
+   (assoc-in db [:aws-connect :skip-connected-resources] value)))
+
+(rf/reg-sub
+ :aws-connect/skip-connected-resources
+ (fn [db _]
+   (get-in db [:aws-connect :skip-connected-resources] true)))
+
+(rf/reg-sub
+ :aws-connect/connected-resources
+ (fn [db _]
+   (get-in db [:aws-connect :resources :connected] [])))
+
+;; Password reset events and subscriptions
+(rf/reg-event-fx
+ :aws-connect/reset-root-passwords
+ (fn [{:keys [db]} _]
+   (let [selected-resources (get-in db [:aws-connect :resources :selected])
+         instances (vec selected-resources)]
+     {:db (-> db
+              (assoc-in [:aws-connect :password-reset :loading?] true)
+              (assoc-in [:aws-connect :loading :active?] true)
+              (assoc-in [:aws-connect :loading :message] "Resetting root passwords..."))
+      :dispatch [:fetch
+                 {:method "POST"
+                  :uri "/integrations/aws/rds/credentials"
+                  :body {:instances instances}
+                  :on-success #(rf/dispatch [:aws-connect/reset-passwords-success %])
+                  :on-failure #(rf/dispatch [:aws-connect/reset-passwords-failure %])}]})))
+
+(rf/reg-event-fx
+ :aws-connect/reset-passwords-success
+ (fn [{:keys [db]} [_ response]]
+   {:db (-> db
+            (assoc-in [:aws-connect :password-reset :loading?] false)
+            (assoc-in [:aws-connect :password-reset :credentials] response)
+            (assoc-in [:aws-connect :password-reset :modal-open?] true)
+            (assoc-in [:aws-connect :loading :active?] false)
+            (assoc-in [:aws-connect :loading :message] nil))}))
+
+(rf/reg-event-fx
+ :aws-connect/reset-passwords-failure
+ (fn [{:keys [db]} [_ response]]
+   {:db (-> db
+            (assoc-in [:aws-connect :password-reset :loading?] false)
+            (assoc-in [:aws-connect :loading :active?] false)
+            (assoc-in [:aws-connect :loading :message] nil))
+    :dispatch [:show-snackbar {:level :error
+                               :text "Failed to reset root passwords"
+                               :details response}]}))
+
+(rf/reg-event-db
+ :aws-connect/set-password-confirmation
+ (fn [db [_ confirmed?]]
+   (assoc-in db [:aws-connect :password-reset :user-confirmed?] confirmed?)))
+
+(rf/reg-event-fx
+ :aws-connect/finish-password-reset
+ (fn [{:keys [db]} _]
+   {:db (-> db
+            (assoc-in [:aws-connect :password-reset :modal-open?] false)
+            (assoc-in [:aws-connect :password-reset :user-confirmed?] false))
+    :dispatch [:aws-connect/create-connections]}))
+
+(rf/reg-sub
+ :aws-connect/password-reset-modal-open?
+ (fn [db _]
+   (get-in db [:aws-connect :password-reset :modal-open?] false)))
+
+(rf/reg-sub
+ :aws-connect/password-reset-credentials
+ (fn [db _]
+   (get-in db [:aws-connect :password-reset :credentials])))
+
+(rf/reg-sub
+ :aws-connect/password-reset-user-confirmed?
+ (fn [db _]
+   (get-in db [:aws-connect :password-reset :user-confirmed?] false)))

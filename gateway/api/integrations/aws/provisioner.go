@@ -18,18 +18,23 @@ import (
 	rdstypes "github.com/aws/aws-sdk-go-v2/service/rds/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go/ptr"
-	"github.com/google/uuid"
 	"github.com/hoophq/hoop/common/log"
 	pbsystem "github.com/hoophq/hoop/common/proto/system"
+	"github.com/hoophq/hoop/common/runbooks"
 	apiconnections "github.com/hoophq/hoop/gateway/api/connections"
 	"github.com/hoophq/hoop/gateway/api/openapi"
+	apirunbooks "github.com/hoophq/hoop/gateway/api/runbooks"
 	"github.com/hoophq/hoop/gateway/appconfig"
 	"github.com/hoophq/hoop/gateway/models"
 	"github.com/hoophq/hoop/gateway/transport/plugins/webhooks"
 	transportsystem "github.com/hoophq/hoop/gateway/transport/system"
 )
 
-const defaultSecurityGroupDescription = "Database ingress rule for connectivity with Hoop Agent"
+const (
+	defaultSecurityGroupDescription = "Database ingress rule for connectivity with Hoop Agent"
+	defaultRunbookName              = "hoop-hooks/aws-connect-post-exec.runbook.py"
+	defaultConnectionTagDbArn       = "hoop.dev/aws-connect.dbarn"
+)
 
 type provisioner struct {
 	cancelFn    context.CancelFunc
@@ -74,6 +79,21 @@ func (p *provisioner) Run(jobID string) error {
 	if err != nil {
 		return fmt.Errorf("failed fetching db instance, reason=%v", err)
 	}
+
+	randomPasswd, err := generateRandomPassword()
+	if err != nil {
+		return fmt.Errorf("failed generating random password: %v", err)
+	}
+	credKeyId := fmt.Sprintf("%s:%s", p.orgID, dbArn)
+	if obj := rdsCredentialsStore.Get(credKeyId); obj != nil {
+		cred, ok := obj.(*openapi.CreateRdsRootPasswordCredentialsInfo)
+		if ok && cred.ExpireAt.After(time.Now().UTC()) {
+			log.With("sid", jobID).Infof("using cached credentials for db instance %v, expires at %v", dbArn, cred.ExpireAt)
+			randomPasswd = cred.Password
+		}
+	}
+
+	databaseTags := parseAWSTags(db)
 	err = models.CreateDBRoleJob(&models.DBRole{
 		OrgID: p.orgID,
 		ID:    jobID,
@@ -83,7 +103,7 @@ func (p *provisioner) Run(jobID string) error {
 			DBArn:         ptr.ToString(db.DBInstanceArn),
 			DBName:        ptr.ToString(db.DBName),
 			DBEngine:      ptr.ToString(db.Engine),
-			Tags:          parseAWSTags(db),
+			Tags:          databaseTags,
 		},
 		Status: &models.DBRoleStatus{
 			Phase:   pbsystem.StatusRunningType,
@@ -93,6 +113,11 @@ func (p *provisioner) Run(jobID string) error {
 	})
 	if err != nil {
 		return fmt.Errorf("unable to create db role job, err=%v", err)
+	}
+
+	runbookConfig, err := apirunbooks.GetRunbookConfig(p.orgID)
+	if err != nil {
+		return err
 	}
 
 	startedAt := time.Now().UTC()
@@ -114,13 +139,6 @@ func (p *provisioner) Run(jobID string) error {
 			}
 		}
 
-		dbEnvID := uuid.NewSHA1(uuid.NameSpaceURL, []byte(fmt.Sprintf("%s:%s", p.orgID, dbArn))).String()
-		env, err := models.GetEnvVarByID(p.orgID, dbEnvID)
-		if err != nil && err != models.ErrNotFound {
-			p.updateJob(pbsystem.NewError(jobID, "failed obtaining master user password: %v", err))
-			return
-		}
-
 		instInput := &modifyInstanceInput{
 			instanceIdentifier:       ptr.ToString(db.DBInstanceIdentifier),
 			instanceCusterIdentifier: ptr.ToString(db.DBClusterIdentifier),
@@ -138,55 +156,47 @@ func (p *provisioner) Run(jobID string) error {
 			instInput.vpcSecurityGroupIds = securityGroupIDs
 		}
 
-		switch err {
-		case models.ErrNotFound:
-			log.With("sid", jobID).Infof("master user password not found, modifying the instance %v", dbArn)
-			randomPasswd, err := generateRandomPassword()
-			if err != nil {
-				p.updateJob(pbsystem.NewError(jobID, "failed generating master user password: %v", err))
-				return
-			}
-			instInput.masterUserPassword = &randomPasswd
-			err = p.modifyRDSInstance(jobID, instInput, func() error {
-				env = &models.EnvVar{
-					OrgID:     p.orgID,
-					ID:        dbEnvID,
-					UpdatedAt: time.Now().UTC(),
-				}
-				env.SetEnv("DATABASE_TYPE", ptr.ToString(db.Engine))
-				env.SetEnv("DATABASE_HOSTNAME", ptr.ToString(db.Endpoint.Address))
-				env.SetEnv("DATABASE_PORT", ptr.ToInt32(db.Endpoint.Port))
-				env.SetEnv("MASTER_USERNAME", ptr.ToString(db.MasterUsername))
-				env.SetEnv("MASTER_PASSWORD", randomPasswd)
-				if err := models.UpsertEnvVar(env); err != nil {
-					return fmt.Errorf("failed updating master credentials: %v", err)
-				}
-				return nil
-			})
-			if err != nil {
-				p.updateJob(pbsystem.NewError(jobID, "failed modifying db instance: %v", err))
-				return
-			}
-		case nil:
-			if err := p.modifyRDSInstance(jobID, instInput, func() error { return nil }); err != nil {
-				p.updateJob(pbsystem.NewError(jobID, "failed modifying db instance: %v", err))
-				return
-			}
-		default:
-			p.updateJob(pbsystem.NewError(jobID, "failed obtaining master user password: %v", err))
+		log.With("sid", jobID).Infof("master user password not found, modifying the instance %v", dbArn)
+		instInput.masterUserPassword = &randomPasswd
+		err = p.modifyRDSInstance(jobID, instInput, func() error { return nil })
+		if err != nil {
+			p.updateJob(pbsystem.NewError(jobID, "failed modifying db instance: %v", err))
 			return
 		}
-		log.With("sid", jobID).Infof("database is available, ready to provision roles for %v", dbArn)
+
 		request := pbsystem.DBProvisionerRequest{
-			OrgID:            env.OrgID,
+			OrgID:            p.orgID,
 			ResourceID:       dbArn,
 			SID:              jobID,
-			DatabaseHostname: env.GetEnv("DATABASE_HOSTNAME"),
-			DatabasePort:     env.GetEnv("DATABASE_PORT"),
-			MasterUsername:   env.GetEnv("MASTER_USERNAME"),
-			MasterPassword:   env.GetEnv("MASTER_PASSWORD"),
-			DatabaseType:     env.GetEnv("DATABASE_TYPE"),
+			DatabaseHostname: ptr.ToString(db.Endpoint.Address),
+			DatabasePort:     fmt.Sprintf("%v", ptr.ToInt32(db.Endpoint.Port)),
+			MasterUsername:   ptr.ToString(db.MasterUsername),
+			MasterPassword:   randomPasswd,
+			DatabaseType:     ptr.ToString(db.Engine),
+			DatabaseTags:     databaseTags,
 		}
+
+		if runbookConfig != nil {
+			repo, err := runbooks.FetchRepository(runbookConfig)
+			if err != nil {
+				log.With("sid", jobID).Warnf("failed clonning repository, reason=%v", err)
+			}
+			if repo != nil {
+				runbook, err := repo.ReadFile(defaultRunbookName, map[string]string{})
+				if err != nil {
+					log.With("sid", jobID).Warnf("failed reading runbook hook file %v, reason=%v", runbook.Name, err)
+				}
+				if runbook != nil {
+					request.ExecHook = &pbsystem.ExecHook{
+						Command:   []string{"python3"},
+						InputFile: string(runbook.InputFile),
+					}
+				}
+			}
+		}
+
+		log.With("sid", jobID, "runbook-hook", request.ExecHook != nil).
+			Infof("database is available, ready to provision roles for %v", dbArn)
 
 		// set vault provider if it's set
 		if p.apiRequest.VaultProvider != nil {
@@ -197,7 +207,7 @@ func (p *provisioner) Run(jobID string) error {
 
 		resp := transportsystem.RunDBProvisioner(p.apiRequest.AgentID, &request)
 		if resp.Status == pbsystem.StatusCompletedType && p.hasStep(openapi.DBRoleJobStepCreateConnections) {
-			if err := p.handleConnectionProvision(request.DatabaseType, resp); err != nil {
+			if err := p.handleConnectionProvision(request, resp); err != nil {
 				log.With("sid", jobID).Errorf("failed provisioning connections: %v", err)
 				resp.Status = pbsystem.StatusFailedType
 				resp.Message = fmt.Sprintf("Failed provisioning connections: %v", err)
@@ -213,9 +223,15 @@ func (p *provisioner) Run(jobID string) error {
 			webhookSent = err == nil
 		}
 
-		log.With("sid", jobID).Infof("database provisioner finished, name=%v, engine=%v, status=%v, with-security-group=%v, webhook-sent=%v, duration=%v, message=%v",
+		runbookOutcome := fmt.Sprintf("hook-executed=%v", resp.RunbookHook != nil)
+		if resp.RunbookHook != nil {
+			runbookOutcome += fmt.Sprintf(", hook-exit-code=%v, hook-execution-time-sec=%v, hook-output-length=%v",
+				resp.RunbookHook.ExitCode, resp.RunbookHook.ExecutionTimeSec, len(resp.RunbookHook.Output))
+		}
+		log.With("sid", jobID).Infof("database provisioner finished, name=%v, engine=%v, status=%v, "+
+			"with-security-group=%v, webhook-sent=%v, duration=%v, message=%v, %v",
 			ptr.ToString(db.DBInstanceIdentifier), ptr.ToString(db.Engine), resp.Status, defaultSg != nil,
-			webhookSent, time.Now().UTC().Sub(startedAt).String(), resp.Message)
+			webhookSent, time.Now().UTC().Sub(startedAt).String(), resp.Message, runbookOutcome)
 
 	}()
 	return nil
@@ -285,10 +301,10 @@ func (p *provisioner) updateJob(resp *pbsystem.DBProvisionerResponse) *models.DB
 	return job
 }
 
-func (p *provisioner) handleConnectionProvision(databaseType string, resp *pbsystem.DBProvisionerResponse) error {
+func (p *provisioner) handleConnectionProvision(req pbsystem.DBProvisionerRequest, resp *pbsystem.DBProvisionerResponse) error {
 	var connections []*models.Connection
 	for _, result := range resp.Result {
-		connSubtype := coerceToSubtype(databaseType)
+		connSubtype := coerceToSubtype(req.DatabaseType)
 		defaultCmd, _ := apiconnections.GetConnectionDefaults("database", connSubtype, true)
 		connections = append(connections, &models.Connection{
 			OrgID:              p.orgID,
@@ -303,6 +319,9 @@ func (p *provisioner) handleConnectionProvision(databaseType string, resp *pbsys
 			AccessModeConnect:  "enabled",
 			AccessSchema:       "enabled",
 			Envs:               parseEnvVars(result.Credentials),
+			ConnectionTags: map[string]string{
+				defaultConnectionTagDbArn: req.ResourceID,
+			},
 		})
 	}
 	return models.UpsertBatchConnections(connections)
@@ -348,7 +367,7 @@ func parseEnvVars(cred *pbsystem.DBCredentials) map[string]string {
 
 func generateRandomPassword() (string, error) {
 	// Character set for passwords (lowercase, uppercase, numbers, special chars)
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789$*_"
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789*_"
 	passwordLength := 25
 
 	// Create a byte slice to store the password
@@ -361,7 +380,7 @@ func generateRandomPassword() (string, error) {
 	}
 
 	// Map random bytes to characters in the charset
-	for i := 0; i < passwordLength; i++ {
+	for i := range passwordLength {
 		// Use modulo to map the random byte to an index in the charset
 		// This ensures the mapping is within the charset boundaries
 		password[i] = charset[int(password[i])%len(charset)]
@@ -498,41 +517,10 @@ func (p *provisioner) sendWebhook(obj *models.DBRole) error {
 	if err := json.Unmarshal(jsonData, &payload); err != nil {
 		return fmt.Errorf("failed decoding json to map: %v", err)
 	}
-
-	if err := p.sendWebhookCustom(*apiObj); err != nil {
-		return err
-	}
 	return webhooks.SendMessage(p.orgID, webhooks.EventDBRoleJobFinishedType, map[string]any{
 		"event_type":    webhooks.EventDBRoleJobFinishedType,
 		"event_payload": payload,
 	})
-}
-
-func (p *provisioner) sendWebhookCustom(job openapi.DBRoleJob) error {
-	payload := map[string]any{
-		"engine":                job.Spec.DBEngine,
-		"tags":                  job.Spec.DBTags,
-		"usr_dbre_namespace_ro": map[string]any{},
-		"usr_dbre_namespace":    map[string]any{},
-	}
-	vaultKeys := map[string]any{}
-	if job.Status != nil && job.Status.Phase == "completed" {
-		for _, res := range job.Status.Result {
-			if res.CredentialsInfo.SecretsManagerProvider == openapi.SecretsManagerProviderVault {
-				vaultKeys[res.UserRole] = map[string]any{
-					"envs":      res.CredentialsInfo.SecretKeys,
-					"namespace": res.CredentialsInfo.SecretID,
-				}
-			}
-		}
-	}
-
-	payload["vault_keys"] = vaultKeys
-	return webhooks.SendMessage(p.orgID, webhooks.EventDBRoleJobCustomFinishedType, map[string]any{
-		"event_type":    webhooks.EventDBRoleJobCustomFinishedType,
-		"event_payload": payload,
-	})
-
 }
 
 func parseAWSTags(obj *rdstypes.DBInstance) []map[string]any {
@@ -544,5 +532,5 @@ func parseAWSTags(obj *rdstypes.DBInstance) []map[string]any {
 }
 
 func b64enc(format string, v ...any) string {
-	return base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf(format, v...)))
+	return base64.StdEncoding.EncodeToString(fmt.Appendf(nil, format, v...))
 }

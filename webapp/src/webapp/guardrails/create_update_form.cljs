@@ -7,11 +7,13 @@
    [webapp.guardrails.helpers :as helpers]
    [webapp.guardrails.form-header :as form-header]
    [webapp.guardrails.basic-info :as basic-info]
+   [webapp.guardrails.connections-section :as connections-section]
    [webapp.guardrails.rules-table :as rules-table]))
 
 (defn guardrail-form [form-type guardrails scroll-pos]
   (let [state (helpers/create-form-state guardrails)
-        handlers (helpers/create-form-handlers state)]
+        handlers (helpers/create-form-handlers state)
+        all-connections (rf/subscribe [:connections])]
     (fn []
       [:> Box {:class "min-h-screen bg-gray-1"}
        [:form {:id "guardrails-form"
@@ -20,6 +22,7 @@
                             (let [data {:id @(:id state)
                                         :name @(:name state)
                                         :description @(:description state)
+                                        :connection_ids @(:connection-ids state)
                                         :input @(:input state)
                                         :output @(:output state)}]
                               (if (= :edit form-type)
@@ -37,7 +40,13 @@
            :on-name-change #(reset! (:name state) %)
            :on-description-change #(reset! (:description state) %)}]
 
-        ;; Rules section
+         ;; Connections section
+         [connections-section/main
+          {:connection-ids (:connection-ids state)
+           :on-connections-change (:on-connections-change handlers)
+           :all-connections (:results @all-connections)}]
+
+         ;; Rules section
          [:> Grid {:columns "7" :gap "7"}
           [:> Box {:grid-column "span 2 / span 2"}
            [:> Flex {:align "center" :gap "2"}
@@ -48,7 +57,7 @@
             "Setup rules with Presets or Custom regular expression scripts."]]
 
           [:> Box {:class "space-y-radix-7" :grid-column "span 5 / span 5"}
-          ;; Input Rules
+           ;; Input Rules
            [rules-table/main
             (merge
              {:title "Input rules"
@@ -58,7 +67,7 @@
               :select-state (:input-select state)}
              handlers)]
 
-          ;; Output Rules
+           ;; Output Rules
            [rules-table/main
             (merge
              {:title "Output rules"
@@ -76,6 +85,8 @@
 (defn main [form-type]
   (let [guardrails->active-guardrail (rf/subscribe [:guardrails->active-guardrail])
         scroll-pos (r/atom 0)]
+
+    (rf/dispatch [:guardrails->get-connections])
     (fn []
       (r/with-let [handle-scroll #(reset! scroll-pos (.-scrollY js/window))]
         (.addEventListener js/window "scroll" handle-scroll)

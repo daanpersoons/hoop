@@ -5,8 +5,10 @@
 (rf/reg-event-db
  :editor-plugin/add-metadata
  (fn [db [_ metadata]]
-   (-> db
-       (update-in [:editor-plugin :metadata] conj metadata))))
+   (let [old-metadata (or (get-in db [:editor-plugin :metadata]) [])]
+     (update db :editor-plugin merge {:metadata (conj old-metadata metadata)
+                                      :metadata-key ""
+                                      :metadata-value ""}))))
 
 (rf/reg-event-db
  :editor-plugin/update-metadata-key
@@ -17,21 +19,6 @@
  :editor-plugin/update-metadata-value
  (fn [db [_ value]]
    (assoc-in db [:editor-plugin :metadata-value] value)))
-
-(rf/reg-event-db
- :editor-plugin/clear-metadata-inputs
- (fn [db [_]]
-   (-> db
-       (assoc-in [:editor-plugin :metadata-key] "")
-       (assoc-in [:editor-plugin :metadata-value] ""))))
-
-(rf/reg-event-db
- :editor-plugin/clear-all-metadata
- (fn [db [_]]
-   (-> db
-       (assoc-in [:editor-plugin :metadata] [])
-       (assoc-in [:editor-plugin :metadata-key] "")
-       (assoc-in [:editor-plugin :metadata-value] ""))))
 
 (rf/reg-event-db
  :editor-plugin/update-metadata-at-index

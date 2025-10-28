@@ -11,7 +11,6 @@ import (
 	"github.com/hoophq/hoop/common/log"
 	"github.com/hoophq/hoop/common/memory"
 	mssqltypes "github.com/hoophq/hoop/common/mssqltypes"
-	pgtypes "github.com/hoophq/hoop/common/pgtypes"
 	pb "github.com/hoophq/hoop/common/proto"
 	pbagent "github.com/hoophq/hoop/common/proto/agent"
 	pbclient "github.com/hoophq/hoop/common/proto/client"
@@ -19,7 +18,6 @@ import (
 	"github.com/hoophq/hoop/gateway/api/openapi"
 	"github.com/hoophq/hoop/gateway/models"
 	eventlogv1 "github.com/hoophq/hoop/gateway/session/eventlog/v1"
-	"github.com/hoophq/hoop/gateway/storagev2/types"
 	plugintypes "github.com/hoophq/hoop/gateway/transport/plugins/types"
 )
 
@@ -44,7 +42,7 @@ func (p *auditPlugin) OnStartup(pctx plugintypes.Context) error {
 	p.started = true
 	return nil
 }
-func (p *auditPlugin) OnUpdate(_, _ *types.Plugin) error { return nil }
+func (p *auditPlugin) OnUpdate(_, _ plugintypes.PluginResource) error { return nil }
 func (p *auditPlugin) OnConnect(pctx plugintypes.Context) error {
 	log.With("sid", pctx.SID).Infof("processing on-connect")
 	if pctx.OrgID == "" || pctx.SID == "" {
@@ -91,6 +89,13 @@ func (p *auditPlugin) OnReceive(pctx plugintypes.Context, pkt *pb.Packet) (*plug
 	eventMetadata := parseSpecAsEventMetadata(pkt)
 	switch pb.PacketType(pkt.GetType()) {
 	case pbagent.SessionOpen:
+		// update session input when executing ad-hoc executions via cli
+		if strings.HasPrefix(pctx.ClientOrigin, pb.ConnectionOriginClient) {
+			if err := models.UpdateSessionInput(pctx.OrgID, pctx.SID, string(pkt.Payload)); err != nil {
+				return nil, plugintypes.InternalErr("failed updating session input", err)
+			}
+		}
+
 		// The session is never cleaned properly when the connection has a review
 		// and the origin is the api. This is a workaround to remove the state.
 		// In the future, we could fix it refactoring the way the api manages the session
@@ -107,15 +112,7 @@ func (p *auditPlugin) OnReceive(pctx plugintypes.Context, pkt *pb.Packet) (*plug
 			return nil, p.writeOnReceive(pctx.SID, eventlogv1.OutputType, nil, eventMetadata)
 		}
 	case pbagent.PGConnectionWrite:
-		isSimpleQuery, queryBytes, err := pgtypes.SimpleQueryContent(pkt.Payload)
-		if !isSimpleQuery {
-			break
-		}
-		if err != nil {
-			log.With("sid", pctx.SID).Errorf("failed parsing simple query data, err=%v", err)
-			return nil, fmt.Errorf("failed obtaining simple query data, reason=%v", err)
-		}
-		return nil, p.writeOnReceive(pctx.SID, eventlogv1.InputType, queryBytes, eventMetadata)
+		return nil, p.writeOnReceive(pctx.SID, eventlogv1.InputType, pkt.Payload, eventMetadata)
 	case pbagent.MySQLConnectionWrite:
 		if queryBytes := decodeMySQLCommandQuery(pkt.Payload); queryBytes != nil {
 			return nil, p.writeOnReceive(pctx.SID, eventlogv1.InputType, queryBytes, eventMetadata)
@@ -143,16 +140,17 @@ func (p *auditPlugin) OnReceive(pctx plugintypes.Context, pkt *pb.Packet) (*plug
 		if decJSONPayload != nil {
 			return nil, p.writeOnReceive(pctx.SID, eventlogv1.InputType, decJSONPayload, eventMetadata)
 		}
-	case pbclient.WriteStdout,
-		pbclient.WriteStderr:
+	case pbclient.WriteStdout, pbclient.WriteStderr:
 		err := p.writeOnReceive(pctx.SID, eventlogv1.OutputType, pkt.Payload, eventMetadata)
 		if err != nil {
 			log.Warnf("failed writing agent packet response, err=%v", err)
 		}
 		return nil, nil
-	case pbagent.ExecWriteStdin,
-		pbagent.TerminalWriteStdin,
-		pbagent.TCPConnectionWrite:
+	case pbagent.ExecWriteStdin, pbagent.TerminalWriteStdin, pbagent.TCPConnectionWrite:
+		return nil, p.writeOnReceive(pctx.SID, eventlogv1.InputType, pkt.Payload, eventMetadata)
+	case pbclient.SSHConnectionWrite:
+		return nil, p.writeOnReceive(pctx.SID, eventlogv1.OutputType, pkt.Payload, eventMetadata)
+	case pbagent.SSHConnectionWrite:
 		return nil, p.writeOnReceive(pctx.SID, eventlogv1.InputType, pkt.Payload, eventMetadata)
 	}
 	return nil, nil

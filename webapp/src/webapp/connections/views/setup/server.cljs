@@ -1,11 +1,12 @@
 ;; server.cljs
 (ns webapp.connections.views.setup.server
   (:require
-   ["@radix-ui/themes" :refer [Avatar Box Card Flex Grid Heading RadioGroup Text]]
+   ["@radix-ui/themes" :refer [Avatar Box Badge Card Flex Grid Heading RadioGroup Text]]
    ["lucide-react" :refer [Blocks SquareTerminal]]
    [re-frame.core :as rf]
    [reagent.core :as r]
    [webapp.components.forms :as forms]
+   [webapp.components.multiselect :as multi-select]
    [webapp.connections.constants :refer [connection-configs-required]]
    [webapp.connections.views.setup.additional-configuration :as additional-configuration]
    [webapp.connections.views.setup.agent-selector :as agent-selector]
@@ -18,8 +19,8 @@
 
 (def connections-subtypes-cards
   {"custom" {:icon (r/as-element [:> SquareTerminal {:size 18}])
-          :title "Linux VM or Container"
-          :subtitle "Secure shell protocol (SSH) for remote access."}
+             :title "Linux VM or Container"
+             :subtitle "Secure shell protocol (SSH) for remote access."}
    "ssh" {:icon (r/as-element [:> SquareTerminal {:size 18}])
           :title "Secure Shell Protocol (SSH)"
           :subtitle "Access and manage with terminal commands."}
@@ -27,34 +28,65 @@
               :title "Console"
               :subtitle "For Ruby on Rails, Python, Node JS and more."}})
 
-(defn credentials-step []
+(defn resource-subtype-override-section []
+  (let [resource-subtype-override @(rf/subscribe [:connection-setup/resource-subtype-override])]
+    [:> Box {:class "space-y-4"}
+     [:> Flex {:align "center" :gap "2"}
+      [:> Heading {:size "3"} "Resource Subtype Override"]
+      [:> Badge {:variant "solid" :color "green" :size "1"} "Beta"]]
+
+     [:> Text {:size "2" :color "gray"}
+      "Configure your connection for specific resource types. Select a subtype only if it matches your actual resource, applying the optimal settings for that resource type."]
+     [:> Text {:size "2" :color "gray"}
+      "This feature is currently in Beta to streamline connections to most common resource types."]
+
+     [:> Box
+      [forms/select
+       {:options [{:text "DynamoDB" :value "dynamodb"}
+                  {:text "CloudWatch" :value "cloudwatch"}]
+        :selected (or resource-subtype-override "")
+        :placeholder "Select one"
+        :on-change #(rf/dispatch [:connection-setup/set-resource-subtype-override %])
+        :full-width? true
+        :not-margin-bottom? true}]]]))
+
+(defn credentials-step [& [mode]]
   [:form
    {:id "credentials-form"
     :on-submit (fn [e]
                  (.preventDefault e)
                  (rf/dispatch [:connection-setup/next-step :additional-config]))}
    [:> Box {:class "space-y-8 max-w-[600px]"}
-   ;; Environment Variables Section
+    ;; Environment Variables Section
     [configuration-inputs/environment-variables-section]
 
-   ;; Configuration Files Section
+    ;; Configuration Files Section
     [configuration-inputs/configuration-files-section]
 
-   ;; Additional Command Section
+    ;; Additional Command Section
     [:> Box {:class "space-y-4"}
      [:> Heading {:size "3"} "Additional command"]
      [:> Text {:size "2" :color "gray"}
-      "Add an additional command that will run on your connection."
+      "Each argument should be entered separately."
       [:br]
-      "Environment variables loaded above can also be used here."]
-     [forms/textarea
-      {:label "Command"
-       :placeholder "$ bash"
-       :value @(rf/subscribe [:connection-setup/command])
-       :on-change #(rf/dispatch [:connection-setup/set-command
-                                 (-> % .-target .-value)])}]]
+      "Press Enter after each argument to add it to the list."]
+     [:> Box
+      [multi-select/text-input
+       {:value @(rf/subscribe [:connection-setup/command-args])
+        :input-value @(rf/subscribe [:connection-setup/command-current-arg])
+        :on-change #(rf/dispatch [:connection-setup/set-command-args %])
+        :on-input-change #(rf/dispatch [:connection-setup/set-command-current-arg %])
+        :label "Command Arguments"
+        :id "command-args"
+        :name "command-args"}]
+      [:> Text {:size "2" :color "gray" :mt "2"}
+       "Example: 'python', '-m', 'http.server', '8000'"]]]
 
-   ;; Agent Section
+    ;; Resource Subtype Override Section (only in update mode)
+    (when (= mode :update)
+      [resource-subtype-override-section])
+
+    ;; Agent Section
     [agent-selector/main]]])
 
 (defn application-type-step []
@@ -95,9 +127,9 @@
                     :on-change #(rf/dispatch [:connection-setup/update-ssh-credentials
                                               key
                                               (-> % .-target .-value)])}]
-     (if (= type "textarea")
-       [forms/textarea base-props]
-       [forms/input base-props])))
+    (if (= type "textarea")
+      [forms/textarea base-props]
+      [forms/input base-props])))
 
 ;; Registrar um evento para controlar o método de autenticação
 (rf/reg-event-db
@@ -116,11 +148,11 @@
         credentials @(rf/subscribe [:connection-setup/ssh-credentials])
         auth-method @(rf/subscribe [:connection-setup/ssh-auth-method])
         filtered-fields (filter (fn [field]
-                                 (case auth-method
-                                   "password" (not= (:key field) "authorized_server_keys")
-                                   "key" (not= (:key field) "pass")
-                                   true))
-                               configs)]
+                                  (case auth-method
+                                    "password" (not= (:key field) "authorized_server_keys")
+                                    "key" (not= (:key field) "pass")
+                                    true))
+                                configs)]
     [:form
      {:id "ssh-credentials-form"
       :on-submit (fn [e]
@@ -148,7 +180,7 @@
         (for [field filtered-fields]
           ^{:key (:key field)}
           [render-ssh-field (assoc field
-                                  :value (get credentials (:key field) (:value field)))])
+                                   :value (get credentials (:key field) (:value field)))])
 
         [agent-selector/main]]]]]))
 
@@ -156,40 +188,40 @@
   (let [connection-subtype @(rf/subscribe [:connection-setup/connection-subtype])
         app-type @(rf/subscribe [:connection-setup/app-type])
         os-type @(rf/subscribe [:connection-setup/os-type])]
-     [:> Box {:class "space-y-7"}
+    [:> Box {:class "space-y-7"}
      ;; Connection Type Selection
-      [:> Box {:class "space-y-4"}
-       [:> Heading {:as "h3" :size "4" :weight "bold" :class "text-[--gray-12]"}
-        "Connection type"]
-       (for [[subtype {:keys [icon title subtitle]}] connections-subtypes-cards]
-         (let [is-selected (= subtype connection-subtype)]
-           ^{:key subtype}
-           [:> Card {:size "1"
-                     :variant "surface"
-                     :class (str "w-full cursor-pointer "
-                                 (when is-selected "before:bg-primary-12"))
-                     :on-click #(rf/dispatch [:connection-setup/select-connection "server" subtype])}
-            [:> Flex {:align "center" :gap "3" :class (str (when is-selected "text-[--gray-1]"))}
-             [:> Avatar {:size "4"
-                         :class (when is-selected "dark")
-                         :variant "soft"
-                         :color "gray"
-                         :fallback icon}]
-             [:> Flex {:direction "column"}
-              [:> Text {:size "3" :weight "medium" :color "gray-12"} title]
-              [:> Text {:size "2" :color "gray-11"} subtitle]]]]))]
+     [:> Box {:class "space-y-4"}
+      [:> Heading {:as "h3" :size "4" :weight "bold" :class "text-[--gray-12]"}
+       "Connection type"]
+      (for [[subtype {:keys [icon title subtitle]}] connections-subtypes-cards]
+        (let [is-selected (= subtype connection-subtype)]
+          ^{:key subtype}
+          [:> Card {:size "1"
+                    :variant "surface"
+                    :class (str "w-full cursor-pointer "
+                                (when is-selected "before:bg-primary-12"))
+                    :on-click #(rf/dispatch [:connection-setup/select-connection "server" subtype])}
+           [:> Flex {:align "center" :gap "3" :class (str (when is-selected "text-[--gray-1]"))}
+            [:> Avatar {:size "4"
+                        :class (when is-selected "dark")
+                        :variant "soft"
+                        :color "gray"
+                        :fallback icon}]
+            [:> Flex {:direction "column"}
+             [:> Text {:size "3" :weight "medium" :color "gray-12"} title]
+             [:> Text {:size "2" :color "gray-11"} subtitle]]]]))]
 
-      (when (= connection-subtype "custom")
-        [credentials-step])
+     (when (= connection-subtype "custom")
+       [credentials-step])
 
-      (when (= connection-subtype "ssh")
-        [ssh-credentials])
+     (when (= connection-subtype "ssh")
+       [ssh-credentials])
 
-      (when (= connection-subtype "console")
-        [application-type-step])
+     (when (= connection-subtype "console")
+       [application-type-step])
 
-      (when (and app-type (not os-type))
-        [operating-system-step])]))
+     (when (and app-type (not os-type))
+       [operating-system-step])]))
 
 
 (defn main [form-type]
@@ -209,17 +241,18 @@
        (case current-step
          :credentials [resource-step]
          :additional-config [additional-configuration/main
-                             {:selected-type connection-subtype
+                             {:show-database-schema? (= connection-subtype "cloudwatch")
+                              :selected-type connection-subtype
                               :form-type form-type
                               :submit-fn (cond
-                                         (= connection-subtype "console")
-                                         #(rf/dispatch [:connection-setup/next-step :installation])
+                                           (= connection-subtype "console")
+                                           #(rf/dispatch [:connection-setup/next-step :installation])
 
-                                         (= connection-subtype "ssh")
-                                         #(rf/dispatch [:connection-setup/submit])
+                                           (= connection-subtype "ssh")
+                                           #(rf/dispatch [:connection-setup/submit])
 
-                                         :else
-                                         #(rf/dispatch [:connection-setup/submit]))}]
+                                           :else
+                                           #(rf/dispatch [:connection-setup/submit]))}]
          :installation [installation/main]
          [resource-step])]
 
@@ -227,54 +260,54 @@
       {:form-type form-type
        :next-text (case current-step
                     :credentials (cond
-                                 (= connection-subtype "console") "Next"
-                                 (= connection-subtype "ssh") "Next: Configuration"
-                                 :else "Next: Configuration")
+                                   (= connection-subtype "console") "Next"
+                                   (= connection-subtype "ssh") "Next: Configuration"
+                                   :else "Next: Configuration")
                     :additional-config (cond
-                                      (= connection-subtype "console") "Next: Installation"
-                                      (= connection-subtype "ssh") "Confirm"
-                                      :else "Confirm")
+                                         (= connection-subtype "console") "Next: Installation"
+                                         (= connection-subtype "ssh") "Confirm"
+                                         :else "Confirm")
                     :installation "Done"
                     "Next")
        :next-disabled? (case current-step
                          :credentials (or (not connection-subtype)
-                                        (and (= connection-subtype "console")
-                                             (or (not app-type)
-                                                 (not os-type))))
+                                          (and (= connection-subtype "console")
+                                               (or (not app-type)
+                                                   (not os-type))))
                          nil)
        :on-click (fn []
                    (when-not (= current-step :installation)
                      (let [form (.getElementById js/document
-                                               (cond
-                                                (= current-step :credentials)
-                                                (if (= connection-subtype "ssh")
-                                                  "ssh-credentials-form"
-                                                  "credentials-form")
+                                                 (cond
+                                                   (= current-step :credentials)
+                                                   (if (= connection-subtype "ssh")
+                                                     "ssh-credentials-form"
+                                                     "credentials-form")
 
-                                                :else
-                                                "additional-config-form"))]
+                                                   :else
+                                                   "additional-config-form"))]
                        (.reportValidity form))))
        :on-next (case current-step
                   :additional-config (cond
-                                     (= connection-subtype "console")
-                                     #(rf/dispatch [:connection-setup/next-step :installation])
+                                       (= connection-subtype "console")
+                                       #(rf/dispatch [:connection-setup/next-step :installation])
 
-                                     :else
-                                     (fn []
-                                       (let [form (.getElementById js/document "additional-config-form")]
-                                         (when form
-                                           (if (and (.reportValidity form)
-                                                    agent-id)
-                                             (let [event (js/Event. "submit" #js {:bubbles true :cancelable true})]
-                                               (.dispatchEvent form event))
-                                             (js/console.warn "Invalid form!"))))))
+                                       :else
+                                       (fn []
+                                         (let [form (.getElementById js/document "additional-config-form")]
+                                           (when form
+                                             (if (and (.reportValidity form)
+                                                      agent-id)
+                                               (let [event (js/Event. "submit" #js {:bubbles true :cancelable true})]
+                                                 (.dispatchEvent form event))
+                                               (js/console.warn "Invalid form!"))))))
                   :installation (fn []
-                                (rf/dispatch [:navigate :connections])
-                                (rf/dispatch [:connection-setup/initialize-state nil]))
+                                  (rf/dispatch [:navigate :connections])
+                                  (rf/dispatch [:connection-setup/initialize-state nil]))
                   (fn []
                     (let [form-id (if (= connection-subtype "ssh")
-                                   "ssh-credentials-form"
-                                   "credentials-form")
+                                    "ssh-credentials-form"
+                                    "credentials-form")
                           form (.getElementById js/document form-id)]
                       (when form
                         (if (and (.reportValidity form)

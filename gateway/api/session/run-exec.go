@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -12,32 +11,18 @@ import (
 	"github.com/hoophq/hoop/common/apiutils"
 	"github.com/hoophq/hoop/common/log"
 	"github.com/hoophq/hoop/gateway/api/apiroutes"
-	"github.com/hoophq/hoop/gateway/api/openapi"
 	"github.com/hoophq/hoop/gateway/clientexec"
 	"github.com/hoophq/hoop/gateway/models"
-	pgplugins "github.com/hoophq/hoop/gateway/pgrest/plugins"
-	pgreview "github.com/hoophq/hoop/gateway/pgrest/review"
 	"github.com/hoophq/hoop/gateway/storagev2"
-	sessionstorage "github.com/hoophq/hoop/gateway/storagev2/session"
-	"github.com/hoophq/hoop/gateway/storagev2/types"
 	plugintypes "github.com/hoophq/hoop/gateway/transport/plugins/types"
 )
-
-func getAccessToken(c *gin.Context) string {
-	tokenHeader := c.GetHeader("authorization")
-	tokenParts := strings.Split(tokenHeader, " ")
-	if len(tokenParts) > 1 {
-		return tokenParts[1]
-	}
-	return ""
-}
 
 // RunReviewedExec
 // TODO: Refactor to use sessionapi.RunExec
 //
 //	@Summary		Reviewed Exec
 //	@Description	Run an execution in a reviewed session
-//	@Tags			Core
+//	@Tags			Sessions
 //	@Accept			json
 //	@Produce		json
 //	@Param			session_id		path		string					true	"The id of the resource"
@@ -50,7 +35,7 @@ func RunReviewedExec(c *gin.Context) {
 
 	sessionId := c.Param("session_id")
 	apiroutes.SetSidSpanAttr(c, sessionId)
-	review, err := pgreview.New().FetchOneBySid(ctx, sessionId)
+	review, err := models.GetReviewByIdOrSid(ctx.OrgID, sessionId)
 	if err != nil {
 		log.Errorf("failed retrieving review, err=%v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "failed retrieving review"})
@@ -75,7 +60,7 @@ func RunReviewedExec(c *gin.Context) {
 	lockExec(sessionId)
 	defer unlockExec(sessionId)
 
-	if review.Type != string(openapi.ReviewTypeOneTime) {
+	if review.Type != models.ReviewTypeOneTime {
 		c.JSON(http.StatusNotFound, gin.H{"message": "session not found"})
 		return
 	}
@@ -98,13 +83,13 @@ func RunReviewedExec(c *gin.Context) {
 		return
 	}
 
-	if review.Status != types.ReviewStatusApproved {
+	if review.Status != models.ReviewStatusApproved {
 		c.JSON(http.StatusBadRequest, gin.H{"message": "review not approved or already executed"})
 		return
 	}
 
-	p, err := pgplugins.New().FetchOne(ctx, plugintypes.PluginReviewName)
-	if err != nil {
+	p, err := models.GetPluginByName(ctx.OrgID, plugintypes.PluginReviewName)
+	if err != nil && err != models.ErrNotFound {
 		log.Errorf("failed obtaining review plugin, err=%v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "failed retrieving review plugin"})
 		return
@@ -112,7 +97,7 @@ func RunReviewedExec(c *gin.Context) {
 	hasReviewPlugin := false
 	if p != nil {
 		for _, conn := range p.Connections {
-			if conn.Name == review.Connection.Name {
+			if conn.ConnectionName == review.ConnectionName {
 				hasReviewPlugin = true
 				break
 			}
@@ -122,7 +107,7 @@ func RunReviewedExec(c *gin.Context) {
 	// The plugin must be active to be able to change the state of the review
 	// after the execution, this will ensure that a review is executed only once.
 	if !hasReviewPlugin {
-		errMsg := fmt.Sprintf("review plugin is not enabled for the connection %s", review.Connection.Name)
+		errMsg := fmt.Sprintf("review plugin is not enabled for the connection %s", review.ConnectionName)
 		log.Infof(errMsg)
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"message": errMsg})
 		return
@@ -138,7 +123,7 @@ func RunReviewedExec(c *gin.Context) {
 		OrgID:          ctx.GetOrgID(),
 		SessionID:      session.ID,
 		ConnectionName: session.Connection,
-		BearerToken:    getAccessToken(c),
+		BearerToken:    apiroutes.GetAccessTokenFromRequest(c),
 		UserAgent:      userAgent,
 	})
 	if err != nil {
@@ -157,16 +142,18 @@ func RunReviewedExec(c *gin.Context) {
 	}()
 	log := log.With("sid", session.ID)
 	log.Infof("review apiexec, reviewid=%v, connection=%v, owner=%v, input-lenght=%v",
-		review.Id, review.Connection.Name, review.CreatedBy, len(review.Input))
+		review.ID, review.ConnectionName, review.OwnerEmail, len(session.BlobInput))
 
 	timeoutCtx, cancelFn := context.WithTimeout(context.Background(), time.Second*50)
-	defer cancelFn()
+	reviewStatus := models.ReviewStatusExecuted
+	defer func() {
+		cancelFn()
+		if err := models.UpdateReviewStatus(review.OrgID, review.ID, reviewStatus); err != nil {
+			log.Warnf("failed updating review to status=%v, err=%v", review.Status, err)
+		}
+	}()
 	select {
 	case resp := <-respCh:
-		review.Status = types.ReviewStatusExecuted
-		if _, err := sessionstorage.PutReview(ctx, review); err != nil {
-			log.Warnf("failed updating review to executed status, err=%v", err)
-		}
 		log.Infof("review exec response, %v", resp)
 		c.JSON(http.StatusOK, resp)
 	case <-timeoutCtx.Done():
@@ -177,10 +164,7 @@ func RunReviewedExec(c *gin.Context) {
 
 		// we do not know the status of this in the future.
 		// replaces the current "PROCESSING" status
-		review.Status = types.ReviewStatusUnknown
-		if _, err := sessionstorage.PutReview(ctx, review); err != nil {
-			log.Warnf("failed updating review to unknown status, err=%v", err)
-		}
+		reviewStatus = models.ReviewStatusUnknown
 		c.JSON(http.StatusAccepted, clientexec.NewTimeoutResponse(session.ID))
 	}
 }

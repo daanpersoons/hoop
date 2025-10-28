@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/getsentry/sentry-go"
 	"github.com/gin-gonic/gin"
@@ -23,7 +22,6 @@ import (
 	"github.com/hoophq/hoop/common/memory"
 	pb "github.com/hoophq/hoop/common/proto"
 	"github.com/hoophq/hoop/gateway/api/apiroutes"
-	apiconnections "github.com/hoophq/hoop/gateway/api/connections"
 	"github.com/hoophq/hoop/gateway/api/openapi"
 	"github.com/hoophq/hoop/gateway/appconfig"
 	"github.com/hoophq/hoop/gateway/clientexec"
@@ -31,7 +29,6 @@ import (
 	"github.com/hoophq/hoop/gateway/jira"
 	"github.com/hoophq/hoop/gateway/models"
 	"github.com/hoophq/hoop/gateway/storagev2"
-	"github.com/hoophq/hoop/gateway/storagev2/types"
 	transportsystem "github.com/hoophq/hoop/gateway/transport/system"
 )
 
@@ -43,12 +40,13 @@ var (
 )
 
 type SessionPostBody struct {
-	Script     string              `json:"script"`
-	Connection string              `json:"connection"`
-	Labels     types.SessionLabels `json:"labels"`
-	Metadata   map[string]any      `json:"metadata"`
-	ClientArgs []string            `json:"client_args"`
-	JiraFields map[string]string   `json:"jira_fields"`
+	Script     string                    `json:"script"`
+	Connection string                    `json:"connection"`
+	EnvVars    map[string]string         `json:"env_vars"`
+	Labels     openapi.SessionLabelsType `json:"labels"`
+	Metadata   map[string]any            `json:"metadata"`
+	ClientArgs []string                  `json:"client_args"`
+	JiraFields map[string]string         `json:"jira_fields"`
 }
 
 // RunExec
@@ -74,17 +72,12 @@ func Post(c *gin.Context) {
 		return
 	}
 
-	// Accept request body and url params as connection name
-	// Maintained for compatibility with legacy endpoint /api/connections/:name/exec
-	if req.Connection == "" {
-		req.Connection = c.Param("name")
-	}
 	if err := CoerceMetadataFields(req.Metadata); err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"message": err.Error()})
 		return
 	}
 
-	conn, err := apiconnections.FetchByName(ctx, req.Connection)
+	conn, err := models.GetConnectionByNameOrID(ctx, req.Connection)
 	if err != nil {
 		log.Errorf("failed fetch connection %v for exec, err=%v", req.Connection, err)
 		sentry.CaptureException(err)
@@ -94,6 +87,12 @@ func Post(c *gin.Context) {
 	if conn == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"message": fmt.Sprintf("connection %v not found", req.Connection)})
 		return
+	}
+
+	for key := range req.EnvVars {
+		if _, ok := conn.Envs[key]; ok {
+			delete(req.EnvVars, key)
+		}
 	}
 
 	userAgent := apiutils.NormalizeUserAgent(c.Request.Header.Values)
@@ -209,7 +208,7 @@ func Post(c *gin.Context) {
 		OrgID:          ctx.GetOrgID(),
 		SessionID:      sid,
 		ConnectionName: conn.Name,
-		BearerToken:    getAccessToken(c),
+		BearerToken:    apiroutes.GetAccessTokenFromRequest(c),
 		UserAgent:      userAgent,
 	})
 	if err != nil {
@@ -223,7 +222,7 @@ func Post(c *gin.Context) {
 	go func() {
 		defer func() { close(respCh); client.Close() }()
 		select {
-		case respCh <- client.Run([]byte(req.Script), nil, req.ClientArgs...):
+		case respCh <- client.Run([]byte(req.Script), req.EnvVars, req.ClientArgs...):
 		default:
 		}
 	}()
@@ -280,9 +279,6 @@ func List(c *gin.Context) {
 		if queryOptVal, ok := c.GetQuery(string(optKey)); ok {
 			switch optKey {
 			case openapi.SessionOptionUser:
-				if !ctx.IsAuditorOrAdminUser() {
-					continue
-				}
 				option.User = queryOptVal
 			case openapi.SessionOptionConnection:
 				option.ConnectionName = queryOptVal
@@ -354,8 +350,8 @@ func List(c *gin.Context) {
 //	@Param					extension	query	openapi.SessionGetByIDParams	false	"-"
 //	@Param					session_id	path	string							true	"The id of the resource"
 //	@Produce				json
-//	@Success				200		{object}	openapi.Session
-//	@Failure				404,500	{object}	openapi.HTTPError
+//	@Success				200				{object}	openapi.Session
+//	@Failure				403,404,422,500	{object}	openapi.HTTPError
 //	@Router					/sessions/{session_id} [get]
 func Get(c *gin.Context) {
 	ctx := storagev2.ParseContext(c)
@@ -417,30 +413,26 @@ func Get(c *gin.Context) {
 	// it will only load the blob stream if it's allowed and the client requested to expand the attribute
 	expandEventStream := slices.Contains(strings.Split(c.Query("expand"), ","), "event_stream")
 	if isAllowed && expandEventStream {
-		blobStream, err := session.GetBlobStream()
+		session.BlobStream, err = session.GetBlobStream()
 		if err != nil {
 			log.Errorf("failed fetching blob stream from session, err=%v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"message": "failed fetching blob stream from session"})
 			return
 		}
-		session.BlobStream = blobStream.BlobStream
 	}
 
-	if option := c.Query("event_stream"); option != "" && expandEventStream {
-		output, err := parseBlobStream(session, sessionParseOption{events: []string{"o", "e"}})
-		if err != nil {
+	mustParseBlobStream := c.Query("event_stream") != "" && expandEventStream
+	if mustParseBlobStream {
+		err = encodeBlobStream(session, openapi.SessionEventStreamType(c.Query("event_stream")))
+		switch err {
+		case errEventStreamUnsupportedFormat:
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"message": errEventStreamUnsupportedFormat.Error()})
+			return
+		case nil:
+		default:
 			log.With("sid", sessionID).Error(err)
 			c.JSON(http.StatusInternalServerError, gin.H{"message": "failed parsing blob stream"})
 			return
-		}
-		switch option {
-		case "utf8":
-			session.BlobStream = json.RawMessage(fmt.Sprintf(`[%q]`, string(output)))
-			session.BlobStreamSize = int64(int64(utf8.RuneCountInString(string(output))))
-		case "base64":
-			encOutput := base64.StdEncoding.EncodeToString(output)
-			session.BlobStream = json.RawMessage(fmt.Sprintf(`[%q]`, encOutput))
-			session.BlobStreamSize = int64(len(encOutput))
 		}
 	}
 	obj := toOpenApiSession(session)
@@ -544,13 +536,12 @@ func DownloadSession(c *gin.Context) {
 			"message": "failed fetching session"})
 		return
 	}
-	blob, err := session.GetBlobStream()
+	session.BlobStream, err = session.GetBlobStream()
 	if err != nil {
 		log.Errorf("failed fetching blob stream from session, err=%v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "failed fetching blob stream from session"})
 		return
 	}
-	session.BlobStream = blob.BlobStream
 	output, err := parseBlobStream(session, sessionParseOption{
 		withLineBreak: withLineBreak,
 		withEventTime: withEventTime,

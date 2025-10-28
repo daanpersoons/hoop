@@ -6,27 +6,18 @@ import (
 	"encoding/hex"
 	"fmt"
 
+	"maps"
+
 	"github.com/google/uuid"
 	"github.com/hoophq/hoop/common/log"
 	"github.com/hoophq/hoop/common/memory"
 	"github.com/hoophq/hoop/common/proto"
 	"github.com/hoophq/hoop/gateway/models"
-	"github.com/hoophq/hoop/gateway/pgrest"
-	pgplugins "github.com/hoophq/hoop/gateway/pgrest/plugins"
-	"github.com/hoophq/hoop/gateway/storagev2/types"
-	plugintypes "github.com/hoophq/hoop/gateway/transport/plugins/types"
 )
 
 var (
 	connectionChecksumStore = memory.New()
 	managedByAgent          = "hoopagent"
-	defaultPlugins          = []string{
-		plugintypes.PluginAuditName,
-		plugintypes.PluginIndexName,
-		plugintypes.PluginEditorName,
-		plugintypes.PluginSlackName,
-		plugintypes.PluginRunbooksName,
-	}
 )
 
 // InvalidateSyncCache remove the connection cache sync state
@@ -56,12 +47,12 @@ func setChecksumCache(orgID string, req *proto.PreConnectRequest) {
 	connectionChecksumStore.Set(syncKey, checksum)
 }
 
-func upsertConnection(ctx pgrest.OrgContext, agentID string, req *proto.PreConnectRequest, conn *models.Connection) error {
+func upsertConnection(orgID, agentID string, req *proto.PreConnectRequest, conn *models.Connection) error {
 	// TODO: implement logic based on license
 	if conn == nil {
 		conn = &models.Connection{
 			ID:        uuid.NewString(),
-			OrgID:     ctx.GetOrgID(),
+			OrgID:     orgID,
 			AgentID:   sql.NullString{String: agentID, Valid: true},
 			ManagedBy: sql.NullString{String: managedByAgent, Valid: true},
 		}
@@ -73,39 +64,26 @@ func upsertConnection(ctx pgrest.OrgContext, agentID string, req *proto.PreConne
 	conn.Name = req.Name
 	conn.Type = req.Type
 	conn.SubType = sql.NullString{String: req.Subtype, Valid: true}
-	conn.Status = pgrest.ConnectionStatusOnline
+	conn.Status = models.ConnectionStatusOnline
+	conn.RedactTypes = req.RedactTypes
+	conn.Reviewers = req.Reviewers
 	conn.AccessModeConnect = "enabled"
 	conn.AccessModeExec = "enabled"
 	conn.AccessModeRunbooks = "enabled"
 	conn.AccessSchema = "enabled"
-	for key, val := range req.Envs {
-		conn.Envs[key] = val
-	}
-
-	if err := models.UpsertConnection(conn); err != nil {
-		return err
-	}
-	pgplugins.EnableDefaultPlugins(ctx, conn.ID, req.Name, defaultPlugins)
-	pgplugins.UpsertPluginConnection(ctx, plugintypes.PluginDLPName, &types.PluginConnection{
-		ID:           uuid.NewString(),
-		ConnectionID: conn.ID,
-		Name:         req.Name,
-		Config:       req.RedactTypes,
-	})
-	pgplugins.UpsertPluginConnection(ctx, plugintypes.PluginReviewName, &types.PluginConnection{
-		ID:           uuid.NewString(),
-		ConnectionID: conn.ID,
-		Name:         req.Name,
-		Config:       req.Reviewers,
-	})
-	return nil
+	maps.Copy(conn.Envs, req.Envs)
+	_, err := models.UpsertConnection(models.NewAdminContext(orgID), conn)
+	return err
 }
 
-func connectionSync(ctx pgrest.OrgContext, agentID string, req *proto.PreConnectRequest) error {
-	if checksumCacheMatches(ctx.GetOrgID(), req) {
+func connectionSync(orgID, agentID string, req *proto.PreConnectRequest) error {
+	if checksumCacheMatches(orgID, req) {
 		return nil
 	}
-	conn, err := models.GetConnectionByNameOrID(ctx.GetOrgID(), req.Name)
+	// It is an internal operation, it must be able
+	// to get the connectinon without any access control group validation
+	adminCtx := models.NewAdminContext(orgID)
+	conn, err := models.GetConnectionByNameOrID(adminCtx, req.Name)
 	if err != nil {
 		return err
 	}
@@ -120,9 +98,9 @@ func connectionSync(ctx pgrest.OrgContext, agentID string, req *proto.PreConnect
 	}
 
 	// update or create a connection with new values
-	if err := upsertConnection(ctx, agentID, req, conn); err != nil {
+	if err := upsertConnection(orgID, agentID, req, conn); err != nil {
 		return err
 	}
-	setChecksumCache(ctx.GetOrgID(), req)
+	setChecksumCache(orgID, req)
 	return nil
 }

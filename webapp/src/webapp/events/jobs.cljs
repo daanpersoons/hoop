@@ -28,7 +28,7 @@
                 (assoc-in [:jobs :has-running-jobs?] false)
                 (assoc-in [:jobs :polling-active?] false))
         :dispatch-n [[:jobs/stop-aws-connect-polling]
-                     [:connections->get-connections]]}))))
+                     [:connections->get-connections {:force-refresh? true}]]}))))
 
 (rf/reg-event-db
  :jobs/fetch-aws-connect-jobs-failure
@@ -36,14 +36,6 @@
    (-> db
        (assoc-in [:jobs :aws-connect] [])
        (assoc-in [:jobs :has-running-jobs?] false))))
-
-(rf/reg-event-fx
- :jobs/start-aws-connect-polling
- (fn [{:keys [db]} _]
-   {:db (assoc-in db [:jobs :polling-active?] true)
-    :dispatch [:jobs/fetch-aws-connect-jobs]
-    :dispatch-later [{:ms 5000
-                      :dispatch [:jobs/continue-aws-connect-polling]}]}))
 
 (rf/reg-event-fx
  :jobs/continue-aws-connect-polling

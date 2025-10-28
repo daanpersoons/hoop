@@ -7,14 +7,13 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/aws/smithy-go/ptr"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
-const (
-	tableSessions string = "private.sessions"
-	tableBlobs    string = "private.blobs"
-)
+// indicates the blob is stored in database wire protocol
+const BlobFormatWireProtoType string = "wire-proto"
 
 type BlobInputType string
 
@@ -72,14 +71,14 @@ type Session struct {
 	Metrics              map[string]any    `gorm:"column:metrics;serializer:json"`
 	BlobInputID          sql.NullString    `gorm:"column:blob_input_id"`
 	BlobInput            BlobInputType     `gorm:"-"`
-	BlobStream           json.RawMessage   `gorm:"-"`
+	BlobStream           *Blob             `gorm:"-"`
 	BlobStreamSize       int64             `gorm:"column:blob_stream_size;->"`
 	UserID               string            `gorm:"column:user_id"`
 	UserName             string            `gorm:"column:user_name"`
 	UserEmail            string            `gorm:"column:user_email"`
 	Status               string            `gorm:"column:status"`
 	ExitCode             *int              `gorm:"column:exit_code"`
-	Review               *Review           `gorm:"column:review;->"`
+	Review               *SessionReview    `gorm:"column:review;->"`
 
 	CreatedAt  time.Time  `gorm:"column:created_at"`
 	EndSession *time.Time `gorm:"column:ended_at"`
@@ -90,6 +89,7 @@ type SessionDone struct {
 	OrgID      string
 	Metrics    map[string]any
 	BlobStream json.RawMessage
+	BlobFormat *string
 	ExitCode   *int
 	Status     string
 	EndSession *time.Time
@@ -117,32 +117,20 @@ type Blob struct {
 	OrgID      string          `gorm:"column:org_id"`
 	BlobStream json.RawMessage `gorm:"column:blob_stream"`
 	Type       string          `gorm:"column:type"`
+	BlobFormat *string         `gorm:"column:format"`
 }
-
-type ReviewGroups struct {
-	ID           string     `json:"id"`
-	ReviewID     string     `json:"review_id"`
-	GroupName    string     `json:"group_name"`
-	Status       string     `json:"status"`
-	OwnerID      *string    `json:"owner_id"`
-	OwnerEmail   *string    `json:"owner_email"`
-	OwnerName    *string    `json:"owner_name"`
-	OwnerSlackID *string    `json:"owner_slack_id"`
-	ReviewedAt   *time.Time `json:"reviewed_at"`
-}
-
-type Review struct {
+type SessionReview struct {
 	ID                string         `json:"id"`
-	SessionID         string         `gorm:"column:session_id"`
+	SessionID         string         `json:"session_id"`
 	Type              string         `json:"type"`
 	Status            string         `json:"status"`
 	CreatedAt         time.Time      `json:"created_at"`
 	RevokedAt         *time.Time     `json:"revoked_at"`
 	AccessDurationSec int64          `json:"access_duration_sec"`
-	ReviewGroups      []ReviewGroups `json:"review_groups"`
+	ReviewGroups      []ReviewGroups `json:"review_groups" gorm:"review_groups;serializer:json"`
 }
 
-func (r *Review) Scan(value any) error {
+func (r *SessionReview) Scan(value any) error {
 	if value == nil {
 		return nil
 	}
@@ -162,11 +150,14 @@ func (r *Review) Scan(value any) error {
 func (s *Session) getBlobInput() (string, error) {
 	var blob Blob
 	err := DB.Raw(`
-	SELECT b.id, b.org_id, b.blob_stream, b.type
+	SELECT b.id, b.org_id, b.blob_stream, b.type, b.format
 	FROM private.sessions s
-	LEFT JOIN private.blobs AS b ON b.type = 'session-input' AND  b.id = s.blob_input_id
+	INNER JOIN private.blobs AS b ON b.type = 'session-input' AND  b.id = s.blob_input_id
 	WHERE s.org_id = ? AND s.id = ?`, s.OrgID, s.ID).
 		First(&blob).Error
+	if err == gorm.ErrRecordNotFound {
+		return "", nil
+	}
 	if err != nil {
 		return "", err
 	}
@@ -181,15 +172,24 @@ func (s *Session) getBlobInput() (string, error) {
 	return result[0], nil
 }
 
+// GetBlobStream retrieves the blob stream associated with the session
+// It returns nil if the session does not have a blob stream associated with it.
 func (s *Session) GetBlobStream() (*Blob, error) {
 	var blob Blob
-	return &blob, DB.Raw(`
-	SELECT b.id, b.org_id, b.blob_stream, b.type
+	err := DB.Raw(`
+	SELECT b.id, b.org_id, b.blob_stream, b.type, b.format
 	FROM private.sessions s
-	LEFT JOIN private.blobs AS b ON b.type = 'session-stream' AND  b.id = s.blob_stream_id
+	INNER JOIN private.blobs AS b ON b.type = 'session-stream' AND  b.id = s.blob_stream_id
 	WHERE s.org_id = ? AND s.id = ?`, s.OrgID, s.ID).
 		First(&blob).Error
+	if err == gorm.ErrRecordNotFound {
+		return nil, nil
+	}
+	return &blob, err
 }
+
+// Report if the blob is stored as database wire protocol format
+func (b Blob) IsWireProtocol() bool { return ptr.ToString(b.BlobFormat) == BlobFormatWireProtoType }
 
 func GetSessionByID(orgID, sid string) (*Session, error) {
 	session := &Session{}
@@ -380,17 +380,17 @@ func UpsertSession(sess Session) error {
 			Type:       "session-input",
 			BlobStream: json.RawMessage(fmt.Sprintf("[%q]", sess.BlobInput)),
 		}
-		res := tx.Table(tableBlobs).
+		res := tx.Table("private.blobs").
 			Where("org_id = ? AND id = ?", sess.OrgID, blobInputID.String).
 			Updates(blobInput)
 		if res.Error == nil && res.RowsAffected == 0 {
-			res.Error = tx.Table(tableBlobs).Create(blobInput).Error
+			res.Error = tx.Table("private.blobs").Create(blobInput).Error
 		}
 
 		if res.Error != nil {
 			return fmt.Errorf("failed creating session blob input, reason=%v", res.Error)
 		}
-		return tx.Table(tableSessions).Save(
+		return tx.Table("private.sessions").Save(
 			Session{
 				ID:                   sess.ID,
 				OrgID:                sess.OrgID,
@@ -429,12 +429,13 @@ func UpdateSessionEventStream(sess SessionDone) error {
 			OrgID:      sess.OrgID,
 			BlobStream: sess.BlobStream,
 			Type:       "session-stream",
+			BlobFormat: sess.BlobFormat,
 		}
-		res := tx.Table(tableBlobs).
+		res := tx.Table("private.blobs").
 			Where("org_id = ? AND id = ?", sess.OrgID, blobStreamID.String).
 			Updates(blobStream)
 		if res.Error == nil && res.RowsAffected == 0 {
-			res.Error = tx.Table(tableBlobs).Create(blobStream).Error
+			res.Error = tx.Table("private.blobs").Create(blobStream).Error
 		}
 
 		if res.Error != nil {
@@ -442,7 +443,7 @@ func UpdateSessionEventStream(sess SessionDone) error {
 		}
 
 		// update: status, labels, metrics, end_date, exit_code, event_stream
-		return tx.Table(tableSessions).
+		return tx.Table("private.sessions").
 			Where("org_id = ? AND id = ?", sess.OrgID, sess.ID).
 			Updates(sessionDone{
 				ID:           sess.ID,
@@ -458,7 +459,7 @@ func UpdateSessionEventStream(sess SessionDone) error {
 }
 
 func UpdateSessionIntegrationMetadata(orgID, sid string, metadata map[string]any) error {
-	res := DB.Table(tableSessions).
+	res := DB.Table("private.sessions").
 		Where("org_id = ? AND id = ?", orgID, sid).
 		Updates(Session{IntegrationsMetadata: metadata})
 	if res.Error == nil && res.RowsAffected == 0 {
@@ -468,13 +469,36 @@ func UpdateSessionIntegrationMetadata(orgID, sid string, metadata map[string]any
 }
 
 func UpdateSessionMetadata(orgID, userEmail, sid string, metadata map[string]any) error {
-	res := DB.Table(tableSessions).
+	res := DB.Table("private.sessions").
 		Where("org_id = ? AND id = ? AND user_email = ?", orgID, sid, userEmail).
 		Updates(Session{Metadata: metadata})
 	if res.Error == nil && res.RowsAffected == 0 {
 		return ErrNotFound
 	}
 	return res.Error
+}
+
+func UpdateSessionInput(orgID, sid, blobInput string) error {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		blobInputID := uuid.NewSHA1(uuid.NameSpaceURL, fmt.Appendf(nil, "blobinput:%s", sid)).String()
+		blobInput := Blob{
+			ID:         blobInputID,
+			OrgID:      orgID,
+			Type:       "session-input",
+			BlobStream: json.RawMessage(fmt.Sprintf("[%q]", blobInput)),
+			BlobFormat: nil,
+		}
+		res := tx.Table("private.blobs").
+			Where("org_id = ? AND id = ?", orgID, blobInputID).
+			Updates(blobInput)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
 }
 
 func GetSessionJiraIssueByID(orgID, sid string) (string, error) {

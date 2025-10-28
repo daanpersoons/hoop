@@ -10,7 +10,6 @@ import (
 	"github.com/hoophq/hoop/common/memory"
 	pb "github.com/hoophq/hoop/common/proto"
 	pbagent "github.com/hoophq/hoop/common/proto/agent"
-	transportext "github.com/hoophq/hoop/gateway/transport/extensions"
 	plugintypes "github.com/hoophq/hoop/gateway/transport/plugins/types"
 	streamtypes "github.com/hoophq/hoop/gateway/transport/streamclient/types"
 	"google.golang.org/grpc/codes"
@@ -138,6 +137,7 @@ func (s *ProxyStream) Save() (err error) {
 
 func (s *ProxyStream) Close(errMsg error) error {
 	// prevent calling if the stream is not in the store
+	defer s.cancelFn(errMsg)
 	if !proxyStore.Has(s.pluginCtx.SID) {
 		return nil
 	}
@@ -148,9 +148,8 @@ func (s *ProxyStream) Close(errMsg error) error {
 		},
 	})
 
-	transportext.OnDisconnect(s.pluginCtx.SID)
+	s.pluginCtx.ExtensionsOnDisconnectFn(s.pluginCtx.SID)
 	_ = s.PluginExecOnDisconnect(*s.pluginCtx, errMsg)
-	s.cancelFn(errMsg)
 	proxyStore.Del(s.pluginCtx.SID)
 	return nil
 }

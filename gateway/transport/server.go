@@ -15,12 +15,11 @@ import (
 	"github.com/hoophq/hoop/common/license"
 	"github.com/hoophq/hoop/common/log"
 	pb "github.com/hoophq/hoop/common/proto"
-	"github.com/hoophq/hoop/gateway/pgrest"
-	"github.com/hoophq/hoop/gateway/review"
-	"github.com/hoophq/hoop/gateway/security/idp"
+	"github.com/hoophq/hoop/gateway/appconfig"
 	"github.com/hoophq/hoop/gateway/storagev2/types"
 	"github.com/hoophq/hoop/gateway/transport/connectionrequests"
 	"github.com/hoophq/hoop/gateway/transport/connectionstatus"
+	transportext "github.com/hoophq/hoop/gateway/transport/extensions"
 	authinterceptor "github.com/hoophq/hoop/gateway/transport/interceptors/auth"
 	sessionuuidinterceptor "github.com/hoophq/hoop/gateway/transport/interceptors/sessionuuid"
 	tracinginterceptor "github.com/hoophq/hoop/gateway/transport/interceptors/tracing"
@@ -39,10 +38,9 @@ type (
 	Server struct {
 		pb.UnimplementedTransportServer
 
-		TLSConfig     *tls.Config
-		ReviewService review.Service
-		IDProvider    *idp.Provider
-		ApiHostname   string
+		TLSConfig   *tls.Config
+		ApiHostname string
+		AppConfig   appconfig.Config
 	}
 )
 
@@ -58,8 +56,8 @@ func (s *Server) StartRPCServer() {
 
 	grpcInterceptors := grpc.ChainStreamInterceptor(
 		sessionuuidinterceptor.New(),
-		authinterceptor.New(s.IDProvider),
-		tracinginterceptor.New(s.IDProvider.ApiURL),
+		authinterceptor.New(),
+		tracinginterceptor.New(s.AppConfig.ApiURL()),
 	)
 	var grpcServer *grpc.Server
 	if s.TLSConfig != nil {
@@ -67,14 +65,14 @@ func (s *Server) StartRPCServer() {
 			grpc.MaxRecvMsgSize(commongrpc.MaxRecvMsgSize),
 			grpc.Creds(credentials.NewTLS(s.TLSConfig)),
 			grpcInterceptors,
-			authinterceptor.WithUnaryValidator(s.IDProvider),
+			authinterceptor.WithUnaryValidator(),
 		)
 	}
 	if grpcServer == nil {
 		grpcServer = grpc.NewServer(
 			grpc.MaxRecvMsgSize(commongrpc.MaxRecvMsgSize),
 			grpcInterceptors,
-			authinterceptor.WithUnaryValidator(s.IDProvider),
+			authinterceptor.WithUnaryValidator(),
 		)
 	}
 	pb.RegisterTransportServer(grpcServer, s)
@@ -96,13 +94,12 @@ func (s *Server) PreConnect(ctx context.Context, req *pb.PreConnectRequest) (*pb
 	if orgID == "" || agentID == "" || agentName == "" {
 		return nil, status.Errorf(codes.Internal, "missing agent context")
 	}
-	orgCtx := pgrest.NewOrgContext(orgID)
-	resp := connectionrequests.AgentPreConnect(orgCtx, agentID, req)
+	resp := connectionrequests.AgentPreConnect(orgID, agentID, req)
 	if resp.Message != "" {
 		log.Warnf("failed processing pre-connect, org=%v, agent=%v, reason=%v",
 			orgID, agentName, resp.Message)
 	}
-	connectionstatus.SetOnlinePreConnect(pgrest.NewOrgContext(orgID), streamtypes.NewStreamID(agentID, req.Name))
+	connectionstatus.SetOnlinePreConnect(orgID, streamtypes.NewStreamID(agentID, req.Name))
 	return resp, nil
 }
 
@@ -130,7 +127,7 @@ func (s *Server) Connect(stream pb.Transport_ConnectServer) (err error) {
 	// consider the type of license as open source.
 	licenseType := license.OSSType
 	if gwctx.UserContext.OrgLicenseData != nil {
-		l, err := license.Parse(*gwctx.UserContext.OrgLicenseData, s.ApiHostname)
+		l, err := license.Parse(gwctx.UserContext.OrgLicenseData, s.ApiHostname)
 		if err != nil {
 			log.Warnf("license is not valid, verify error: %v", err)
 			return status.Error(codes.FailedPrecondition, license.ErrNotValid.Error())
@@ -143,22 +140,23 @@ func (s *Server) Connect(stream pb.Transport_ConnectServer) (err error) {
 		SID:     "",
 
 		OrgID:          gwctx.UserContext.OrgID,
-		OrgName:        gwctx.UserContext.OrgName, // TODO: it's not set when it's a service account
+		OrgName:        gwctx.UserContext.OrgName,
 		OrgLicenseType: licenseType,
 		UserID:         gwctx.UserContext.UserID,
 		UserName:       gwctx.UserContext.UserName,
 		UserEmail:      gwctx.UserContext.UserEmail,
-		UserSlackID:    gwctx.UserContext.SlackID,
+		UserSlackID:    gwctx.UserContext.UserSlackID,
 		UserGroups:     gwctx.UserContext.UserGroups,
 
 		ConnectionID:                        gwctx.Connection.ID,
 		ConnectionName:                      gwctx.Connection.Name,
 		ConnectionType:                      gwctx.Connection.Type,
 		ConnectionSubType:                   gwctx.Connection.SubType,
-		ConnectionCommand:                   gwctx.Connection.CmdEntrypoint,
+		ConnectionCommand:                   gwctx.Connection.Command,
 		ConnectionSecret:                    gwctx.Connection.Secrets,
 		ConnectionJiraTransitionNameOnClose: gwctx.Connection.JiraTransitionNameOnSessionClose,
 		ConnectionTags:                      gwctx.Connection.Tags,
+		ConnectionReviewers:                 gwctx.Connection.Reviewers,
 
 		AgentID:   gwctx.Connection.AgentID,
 		AgentName: gwctx.Connection.AgentName,
@@ -168,7 +166,8 @@ func (s *Server) Connect(stream pb.Transport_ConnectServer) (err error) {
 		ClientVerb:   "",
 		ClientOrigin: "",
 
-		ParamsData: map[string]any{},
+		ParamsData:               map[string]any{},
+		ExtensionsOnDisconnectFn: transportext.OnDisconnect,
 	}
 
 	if err := validateConnectionAccessMode(clientVerb[0], clientOrigin[0], gwctx.Connection); err != nil {
@@ -181,6 +180,10 @@ func (s *Server) Connect(stream pb.Transport_ConnectServer) (err error) {
 	default:
 		return s.subscribeClient(streamclient.NewProxy(pluginCtx, stream))
 	}
+}
+
+func (s *Server) HealthCheck(ctx context.Context, req *pb.HealthCheckRequest) (*pb.HealthCheckResponse, error) {
+	return &pb.HealthCheckResponse{Status: "OK"}, nil
 }
 
 func validateConnectionAccessMode(clientVerb, clientOrigin string, connInfo types.ConnectionInfo) error {

@@ -8,23 +8,19 @@ import (
 	"strings"
 	"time"
 
-	"github.com/getsentry/sentry-go"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/hoophq/hoop/common/apiutils"
 	"github.com/hoophq/hoop/common/log"
 	"github.com/hoophq/hoop/common/proto"
+	"github.com/hoophq/hoop/common/runbooks"
 	"github.com/hoophq/hoop/gateway/api/apiroutes"
-	apiconnections "github.com/hoophq/hoop/gateway/api/connections"
 	"github.com/hoophq/hoop/gateway/api/openapi"
-	"github.com/hoophq/hoop/gateway/api/runbooks/templates"
 	sessionapi "github.com/hoophq/hoop/gateway/api/session"
 	"github.com/hoophq/hoop/gateway/clientexec"
+	"github.com/hoophq/hoop/gateway/jira"
 	"github.com/hoophq/hoop/gateway/models"
-	"github.com/hoophq/hoop/gateway/pgrest"
-	pgplugins "github.com/hoophq/hoop/gateway/pgrest/plugins"
 	"github.com/hoophq/hoop/gateway/storagev2"
-	"github.com/hoophq/hoop/gateway/storagev2/types"
 	plugintypes "github.com/hoophq/hoop/gateway/transport/plugins/types"
 )
 
@@ -40,23 +36,23 @@ import (
 func List(c *gin.Context) {
 	ctx := storagev2.ParseContext(c)
 
-	p, err := pgplugins.New().FetchOne(ctx, plugintypes.PluginRunbooksName)
-	if err != nil {
-		log.Errorf("failed retrieving runbook plugin, reason=%v", err)
-		sentry.CaptureException(err)
-		c.JSON(http.StatusInternalServerError,
-			gin.H{"message": "failed retrieving runbook plugin"})
-		return
-	}
-	if p == nil {
+	p, err := models.GetPluginByName(ctx.GetOrgID(), plugintypes.PluginRunbooksName)
+	switch err {
+	case models.ErrNotFound:
 		c.JSON(http.StatusNotFound, gin.H{"message": "plugin runbooks not found"})
+		return
+	case nil:
+	default:
+		log.Errorf("failed retrieving runbook plugin, reason=%v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "failed retrieving runbook plugin"})
 		return
 	}
 	var configEnvVars map[string]string
-	if p.Config != nil {
-		configEnvVars = p.Config.EnvVars
+	if p.EnvVars != nil {
+		configEnvVars = p.EnvVars
 	}
-	config, err := templates.NewRunbookConfig(configEnvVars)
+
+	config, err := runbooks.NewConfig(configEnvVars)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"message": err.Error()})
 		return
@@ -83,22 +79,22 @@ func List(c *gin.Context) {
 func ListByConnection(c *gin.Context) {
 	ctx := storagev2.ParseContext(c)
 	connectionName := c.Param("name")
-	p, err := pgplugins.New().FetchOne(ctx, plugintypes.PluginRunbooksName)
-	if err != nil {
+	p, err := models.GetPluginByName(ctx.GetOrgID(), plugintypes.PluginRunbooksName)
+	switch err {
+	case models.ErrNotFound:
+		c.JSON(http.StatusBadRequest, gin.H{"message": "plugin runbooks not found"})
+		return
+	case nil:
+	default:
 		log.Errorf("failed retrieving runbook plugin, reason=%v", err)
-		sentry.CaptureException(err)
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "failed retrieving runbook plugin"})
 		return
 	}
-	if p == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"message": "plugin runbooks not found"})
-		return
-	}
 	var configEnvVars map[string]string
-	if p.Config != nil {
-		configEnvVars = p.Config.EnvVars
+	if p.EnvVars != nil {
+		configEnvVars = p.EnvVars
 	}
-	config, err := templates.NewRunbookConfig(configEnvVars)
+	config, err := runbooks.NewConfig(configEnvVars)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"message": err.Error()})
 		return
@@ -106,7 +102,7 @@ func ListByConnection(c *gin.Context) {
 	hasConnection := false
 	var pathPrefix string
 	for _, conn := range p.Connections {
-		if conn.Name == connectionName {
+		if conn.ConnectionName == connectionName {
 			if len(conn.Config) > 0 {
 				pathPrefix = conn.Config[0]
 			}
@@ -130,7 +126,7 @@ func ListByConnection(c *gin.Context) {
 // RunRunbookExec
 //
 //	@Summary		Runbook Exec
-//	@Description	Start a execution using a Runbook as input
+//	@Description	Start a execution using a Runbook as input. If the connection has a JIRA issue template configured, it will create a JIRA issue.
 //	@Tags			Runbooks
 //	@Accept			json
 //	@Produce		json
@@ -154,7 +150,7 @@ func RunExec(c *gin.Context) {
 	connectionName := c.Param("name")
 	connection, err := getConnection(ctx, c, connectionName)
 	if err != nil {
-		log.Error(err)
+		log.Warn(err)
 		return
 	}
 	config, pathPrefix, err := getRunbookConfig(ctx, c, connection)
@@ -166,9 +162,19 @@ func RunExec(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"message": fmt.Sprintf("runbook file %v not found", req.FileName)})
 		return
 	}
-	runbook, err := fetchRunbookFile(config, req)
+	repo, err := runbooks.FetchRepository(config)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+		return
+	}
+	runbook, err := repo.ReadFile(req.FileName, req.Parameters)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+		return
+	}
+
+	if runbook == nil {
+		c.JSON(http.StatusNotFound, gin.H{"message": fmt.Sprintf("runbook file %v not found on git repo", req.FileName)})
 		return
 	}
 
@@ -181,7 +187,7 @@ func RunExec(c *gin.Context) {
 	}
 
 	runbookParamsJson, _ := json.Marshal(req.Parameters)
-	sessionLabels := types.SessionLabels{
+	sessionLabels := openapi.SessionLabelsType{
 		"runbookFile":       req.FileName,
 		"runbookParameters": string(runbookParamsJson),
 	}
@@ -197,7 +203,7 @@ func RunExec(c *gin.Context) {
 		OrgID:          ctx.GetOrgID(),
 		SessionID:      sessionID,
 		ConnectionName: connectionName,
-		BearerToken:    getAccessToken(c),
+		BearerToken:    apiroutes.GetAccessTokenFromRequest(c),
 		UserAgent:      userAgent,
 		Origin:         proto.ConnectionOriginClientAPIRunbooks,
 	})
@@ -211,7 +217,7 @@ func RunExec(c *gin.Context) {
 		ID:                   sessionID,
 		OrgID:                ctx.GetOrgID(),
 		Connection:           connectionName,
-		ConnectionType:       string(proto.ConnectionTypeCustom),
+		ConnectionType:       connection.Type,
 		ConnectionSubtype:    connection.SubType.String,
 		Verb:                 proto.ClientVerbExec,
 		Labels:               sessionLabels,
@@ -228,6 +234,41 @@ func RunExec(c *gin.Context) {
 		EndSession:           nil,
 	}
 
+	if connection.JiraIssueTemplateID.String != "" {
+		issueTemplate, jiraConfig, err := models.GetJiraIssueTemplatesByID(connection.OrgID, connection.JiraIssueTemplateID.String)
+		if err != nil {
+			log.Errorf("failed obtaining jira issue template for %v, reason=%v", connection.Name, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"message": fmt.Sprintf("failed obtaining jira issue template: %v", err)})
+			return
+		}
+		if jiraConfig != nil && jiraConfig.IsActive() {
+			if req.JiraFields == nil {
+				req.JiraFields = map[string]string{}
+			}
+			jiraFields, err := jira.ParseIssueFields(issueTemplate, req.JiraFields, newSession)
+			switch err.(type) {
+			case *jira.ErrInvalidIssueFields:
+				c.JSON(http.StatusUnprocessableEntity, gin.H{"message": err.Error()})
+				return
+			case nil:
+			default:
+				log.Error(err)
+				c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
+				return
+			}
+			resp, err := jira.CreateCustomerRequest(issueTemplate, jiraConfig, jiraFields)
+			if err != nil {
+				log.Error(err)
+				c.JSON(http.StatusInternalServerError, gin.H{"message": err.Error()})
+				return
+			}
+			newSession.IntegrationsMetadata = map[string]any{
+				"jira_issue_key": resp.IssueKey,
+				"jira_issue_url": resp.Links.Agent,
+			}
+		}
+	}
+
 	if err := models.UpsertSession(newSession); err != nil {
 		log.Errorf("failed persisting session, err=%v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "The session couldn't be created"})
@@ -240,7 +281,7 @@ func RunExec(c *gin.Context) {
 	}
 	log := log.With("sid", sessionID)
 	log.Infof("runbook exec, commit=%s, name=%s, connection=%s, parameters=%v",
-		runbook.CommitHash[:8], req.FileName, connectionName, strings.TrimSpace(params))
+		runbook.CommitSHA[:8], req.FileName, connectionName, strings.TrimSpace(params))
 
 	respCh := make(chan *clientexec.Response)
 	go func() {
@@ -264,10 +305,9 @@ func RunExec(c *gin.Context) {
 	}
 }
 
-func getConnection(ctx pgrest.Context, c *gin.Context, connectionName string) (*models.Connection, error) {
-	conn, err := apiconnections.FetchByName(ctx, connectionName)
+func getConnection(ctx models.UserContext, c *gin.Context, connectionName string) (*models.Connection, error) {
+	conn, err := models.GetConnectionByNameOrID(ctx, connectionName)
 	if err != nil {
-		sentry.CaptureException(err)
 		c.JSON(http.StatusInternalServerError, gin.H{"message": "failed retrieving connection"})
 		return nil, err
 	}
@@ -278,15 +318,16 @@ func getConnection(ctx pgrest.Context, c *gin.Context, connectionName string) (*
 	return conn, nil
 }
 
-func getRunbookConfig(ctx pgrest.Context, c *gin.Context, connection *models.Connection) (*templates.RunbookConfig, string, error) {
-	p, err := pgplugins.New().FetchOne(ctx, plugintypes.PluginRunbooksName)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"message": "failed retrieving runbook plugin"})
-		return nil, "", fmt.Errorf("failed retrieving runbooks plugin, err=%v", err)
-	}
-	if p == nil {
+func getRunbookConfig(ctx models.UserContext, c *gin.Context, connection *models.Connection) (*runbooks.Config, string, error) {
+	p, err := models.GetPluginByName(ctx.GetOrgID(), plugintypes.PluginRunbooksName)
+	switch err {
+	case models.ErrNotFound:
 		c.JSON(http.StatusNotFound, gin.H{"message": "plugin not found"})
 		return nil, "", fmt.Errorf("plugin not found")
+	case nil:
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "failed retrieving runbook plugin"})
+		return nil, "", fmt.Errorf("failed retrieving runbooks plugin, err=%v", err)
 	}
 	var repoPrefix string
 	hasConnection := false
@@ -304,13 +345,33 @@ func getRunbookConfig(ctx pgrest.Context, c *gin.Context, connection *models.Con
 		return nil, repoPrefix, fmt.Errorf("plugin is not enabled for this connection")
 	}
 	var configEnvVars map[string]string
-	if p.Config != nil {
-		configEnvVars = p.Config.EnvVars
+	if p.EnvVars != nil {
+		configEnvVars = p.EnvVars
 	}
-	runbookConfig, err := templates.NewRunbookConfig(configEnvVars)
+	runbookConfig, err := runbooks.NewConfig(configEnvVars)
 	if err != nil {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"message": err.Error()})
 		return nil, repoPrefix, err
 	}
 	return runbookConfig, repoPrefix, nil
+}
+
+// GetRunbookConfig returns the runbook if the plugin is enabled and there's an existent configuration set
+func GetRunbookConfig(orgID string) (*runbooks.Config, error) {
+	p, err := models.GetPluginByName(orgID, plugintypes.PluginRunbooksName)
+	switch err {
+	case models.ErrNotFound:
+		return nil, nil
+	case nil:
+		if len(p.EnvVars) == 0 {
+			return nil, nil
+		}
+	default:
+		return nil, fmt.Errorf("failed retrieving runbooks plugin, err=%v", err)
+	}
+	runbookConfig, err := runbooks.NewConfig(p.EnvVars)
+	if err != nil {
+		return nil, err
+	}
+	return runbookConfig, nil
 }

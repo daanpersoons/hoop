@@ -3,7 +3,6 @@ package authinterceptor
 import (
 	"context"
 	"errors"
-	"os"
 	"strings"
 
 	"github.com/getsentry/sentry-go"
@@ -12,14 +11,11 @@ import (
 	commongrpc "github.com/hoophq/hoop/common/grpc"
 	"github.com/hoophq/hoop/common/log"
 	pb "github.com/hoophq/hoop/common/proto"
-	apiconnections "github.com/hoophq/hoop/gateway/api/connections"
 	"github.com/hoophq/hoop/gateway/appconfig"
 	"github.com/hoophq/hoop/gateway/clientexec"
-	"github.com/hoophq/hoop/gateway/pgrest"
-	pgagents "github.com/hoophq/hoop/gateway/pgrest/agents"
-	pgorgs "github.com/hoophq/hoop/gateway/pgrest/orgs"
-	pguserauth "github.com/hoophq/hoop/gateway/pgrest/userauth"
-	"github.com/hoophq/hoop/gateway/security/idp"
+	"github.com/hoophq/hoop/gateway/idp"
+	"github.com/hoophq/hoop/gateway/models"
+	"github.com/hoophq/hoop/gateway/proxyproto/grpckey"
 	"github.com/hoophq/hoop/gateway/storagev2/types"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -36,14 +32,10 @@ type serverStreamWrapper struct {
 	newCtxVal any
 }
 
-type interceptor struct {
-	idp *idp.Provider
-}
+type interceptor struct{}
 
-func New(idpProvider *idp.Provider) grpc.StreamServerInterceptor {
-	return (&interceptor{
-		idp: idpProvider,
-	}).StreamServerInterceptor
+func New() grpc.StreamServerInterceptor {
+	return (&interceptor{}).StreamServerInterceptor
 }
 
 func (s *serverStreamWrapper) Context() context.Context {
@@ -68,6 +60,7 @@ func (s *serverStreamWrapper) Context() context.Context {
 			}
 			if v.UserContext.OrgID != "" {
 				mdCopy.Set("org-id", v.UserContext.OrgID)
+				mdCopy.Set("user-id", v.UserContext.UserID)
 				mdCopy.Set("user-email", v.UserContext.UserEmail)
 			}
 			if v.Agent.ID != "" {
@@ -84,6 +77,11 @@ func (s *serverStreamWrapper) Context() context.Context {
 }
 
 func (i *interceptor) StreamServerInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	tokenVerifier, serverConfig, err := idp.NewTokenVerifierProvider()
+	if err != nil {
+		log.Errorf("failed to initialize identity provider, err=%v", err)
+		return status.Error(codes.Internal, "internal error, unable to initialize identity provider")
+	}
 	md, ok := metadata.FromIncomingContext(ss.Context())
 	if !ok {
 		return status.Error(codes.InvalidArgument, "missing context metadata")
@@ -105,7 +103,7 @@ func (i *interceptor) StreamServerInterceptor(srv any, ss grpc.ServerStream, inf
 		}
 	}
 
-	bearerToken, err := parseBearerToken(md)
+	bearerToken, isApiKey, err := parseBearerToken(md)
 	if err != nil {
 		return err
 	}
@@ -119,63 +117,64 @@ func (i *interceptor) StreamServerInterceptor(srv any, ss grpc.ServerStream, inf
 			return err
 		}
 		ctxVal = &GatewayContext{
-			Agent:       *ag,
-			BearerToken: bearerToken,
+			Agent: *ag,
 		}
 	// client proxy manager authentication (access token)
 	case pb.ConnectionOriginClientProxyManager:
-		subject, err := i.validateAccessToken(bearerToken)
+		subject, err := tokenVerifier.VerifyAccessToken(bearerToken)
 		if err != nil {
 			log.Debugf("failed verifying access token, reason=%v", err)
 			return status.Errorf(codes.Unauthenticated, "invalid authentication")
 		}
-		userCtx, err := pguserauth.New().FetchUserContext(subject)
-		if err != nil || userCtx.IsEmpty() {
+		userCtx, err := models.GetUserContext(subject)
+		if err != nil {
 			log.Errorf("failed fetching user context, reason=%v", err)
+			return status.Errorf(codes.Unauthenticated, "invalid authentication")
+		}
+		if userCtx.IsEmpty() {
 			return status.Errorf(codes.Unauthenticated, "invalid authentication")
 		}
 		if userCtx.UserStatus != string(types.UserStatusActive) {
 			return status.Errorf(codes.Unauthenticated, "user is not active")
 		}
+
+		// Maintain backward compatibility with legacy user context propagation.
+		// This behavior was preserved during migration from XTDB to PostgreSQL.
+		// TODO: Refactor to implement proper user information propagation in a future release.
+		userCtx.UserID = userCtx.UserSubject
 		ctxVal = &GatewayContext{
-			UserContext: *userCtx.ToAPIContext(),
-			BearerToken: bearerToken,
+			UserContext: *userCtx,
 		}
 	// client proxy authentication (access token)
 	default:
-		apiKeyEnv := os.Getenv("API_KEY")
-		isOrgMultitenant := appconfig.Get().OrgMultitenant()
-		// this is a not so optimal solution, but due to the overall
-		// complexity of the authentication system, we decided to make this
-		// simple comparison on a optimistic way and if it fails, we fallback
-		// to the regular authentication flow with the IDP (see else stetament)
-		if apiKeyEnv != "" && apiKeyEnv == bearerToken && !isOrgMultitenant {
-			log.Debug("Authenticating with API key")
-			orgID := strings.Split(bearerToken, "|")[0]
-			newOrgCtx := pgrest.NewOrgContext(orgID)
-			org, err := pgorgs.New().FetchOrgByContext(newOrgCtx)
-			if err != nil || org == nil {
+		if isApiKey {
+			log.Debug("user provided an api key for authentication")
+			if appconfig.Get().OrgMultitenant() {
+				return status.Errorf(codes.Unauthenticated, "invalid authentication")
+			}
+
+			if serverConfig.ApiKey == "" || serverConfig.ApiKey != bearerToken {
 				return status.Errorf(codes.Unauthenticated, "invalid authentication")
 			}
 			deterministicUuid := uuid.NewSHA1(uuid.NameSpaceURL, []byte(`API_KEY`))
-			ctx := &pguserauth.Context{
-				OrgID:       orgID,
-				OrgName:     org.Name,
-				OrgLicense:  org.License,
-				UserUUID:    deterministicUuid.String(),
-				UserSubject: "API_KEY",
-				UserName:    "API_KEY",
-				UserEmail:   "API_KEY",
-				UserStatus:  "active",
-				UserGroups:  []string{types.GroupAdmin},
+			org, err := models.GetOrganizationByNameOrID(serverConfig.OrgID)
+			if err != nil {
+				return status.Errorf(codes.Unauthenticated, "invalid authentication")
 			}
-
+			ctx := &models.Context{
+				OrgID:          org.ID,
+				OrgName:        org.Name,
+				OrgLicenseData: org.LicenseData,
+				UserID:         deterministicUuid.String(),
+				UserSubject:    "API_KEY",
+				UserName:       "API_KEY",
+				UserEmail:      "API_KEY",
+				UserStatus:     "active",
+				UserGroups:     []string{types.GroupAdmin},
+			}
 			gwctx := &GatewayContext{
-				UserContext: *ctx.ToAPIContext(),
-				BearerToken: bearerToken,
+				UserContext: *ctx,
 			}
-
-			gwctx.UserContext.ApiURL = os.Getenv("API_URL")
 			connectionName := commongrpc.MetaGet(md, "connection-name")
 			conn, err := i.getConnection(connectionName, ctx)
 			if err != nil {
@@ -188,14 +187,33 @@ func (i *interceptor) StreamServerInterceptor(srv any, ss grpc.ServerStream, inf
 			ctxVal = gwctx
 			break
 		}
-		// first we check if the auth method is local, if so, we authenticate the user
-		// using the local auth method, otherwise we use the i.idp.VerifyAccessToken
-		subject, err := i.validateAccessToken(bearerToken)
-		if err != nil {
-			log.Debugf("failed verifying access token, reason=%v", err)
-			return status.Errorf(codes.Unauthenticated, "invalid authentication")
+
+		var subject string
+		impersonateAuthKey := md.Get(grpckey.ImpersonateAuthKeyHeaderKey)
+		if len(impersonateAuthKey) > 0 {
+			if impersonateAuthKey[0] != grpckey.ImpersonateSecretKey {
+				errMsg := "failed validating impersonation, impersonate auth key attribute is missing or does not match"
+				log.Warn(errMsg)
+				return status.Errorf(codes.Unauthenticated, "invalid authentication")
+			}
+			userSubjectVal := md.Get(grpckey.ImpersonateUserSubjectHeaderKey)
+			if len(userSubjectVal) == 0 || userSubjectVal[0] == "" {
+				errMsg := "failed validating impersonation, impersonate subject attribute is missing"
+				log.Warn(errMsg)
+				return status.Errorf(codes.Unauthenticated, "invalid authentication")
+			}
+			subject = userSubjectVal[0]
+		} else {
+			// first we check if the auth method is local, if so, we authenticate the user
+			// using the local auth method, otherwise we use the tokenVerifier.VerifyAccessToken
+			subject, err = tokenVerifier.VerifyAccessToken(bearerToken)
+			if err != nil {
+				log.Debugf("failed verifying access token, reason=%v", err)
+				return status.Errorf(codes.Unauthenticated, "invalid authentication")
+			}
 		}
-		userCtx, err := pguserauth.New().FetchUserContext(subject)
+
+		userCtx, err := models.GetUserContext(subject)
 		if err != nil || userCtx.IsEmpty() {
 			return status.Errorf(codes.Unauthenticated, "invalid authentication")
 		}
@@ -203,11 +221,14 @@ func (i *interceptor) StreamServerInterceptor(srv any, ss grpc.ServerStream, inf
 		if userCtx.UserStatus != string(types.UserStatusActive) {
 			return status.Errorf(codes.Unauthenticated, "user is not active")
 		}
+
+		// Maintain backward compatibility with legacy user context propagation.
+		// This behavior was preserved during migration from XTDB to PostgreSQL.
+		// TODO: Refactor to implement proper user information propagation in a future release.
+		userCtx.UserID = userCtx.UserSubject
 		gwctx := &GatewayContext{
-			UserContext: *userCtx.ToAPIContext(),
-			BearerToken: bearerToken,
+			UserContext: *userCtx,
 		}
-		gwctx.UserContext.ApiURL = i.idp.ApiURL
 		connectionName := commongrpc.MetaGet(md, "connection-name")
 		conn, err := i.getConnection(connectionName, userCtx)
 		if err != nil {
@@ -223,15 +244,8 @@ func (i *interceptor) StreamServerInterceptor(srv any, ss grpc.ServerStream, inf
 	return handler(srv, &serverStreamWrapper{ss, nil, ctxVal})
 }
 
-func (i *interceptor) validateAccessToken(bearerToken string) (subject string, err error) {
-	if i.idp.HasSecretKey() {
-		return i.idp.VerifyAccessTokenHS256Alg(bearerToken)
-	}
-	return i.idp.VerifyAccessToken(bearerToken)
-}
-
-func (i *interceptor) getConnection(name string, userCtx *pguserauth.Context) (*types.ConnectionInfo, error) {
-	conn, err := apiconnections.FetchByName(userCtx, name)
+func (i *interceptor) getConnection(name string, userCtx *models.Context) (*types.ConnectionInfo, error) {
+	conn, err := models.GetConnectionByNameOrID(userCtx, name)
 	if err != nil {
 		log.Errorf("failed retrieving connection %v, err=%v", name, err)
 		sentry.CaptureException(err)
@@ -245,7 +259,7 @@ func (i *interceptor) getConnection(name string, userCtx *pguserauth.Context) (*
 		Name:                             conn.Name,
 		Type:                             string(conn.Type),
 		SubType:                          conn.SubType.String,
-		CmdEntrypoint:                    conn.Command,
+		Command:                          conn.Command,
 		Secrets:                          conn.AsSecrets(),
 		Tags:                             conn.ConnectionTags,
 		AgentID:                          conn.AgentID.String,
@@ -255,14 +269,15 @@ func (i *interceptor) getConnection(name string, userCtx *pguserauth.Context) (*
 		AccessModeExec:                   conn.AccessModeExec,
 		AccessModeConnect:                conn.AccessModeConnect,
 		AccessSchema:                     conn.AccessSchema,
+		Reviewers:                        conn.Reviewers,
 		JiraTransitionNameOnSessionClose: conn.JiraTransitionNameOnClose.String,
 	}, nil
 }
 
-func (i *interceptor) authenticateAgent(bearerToken string, md metadata.MD) (*pgrest.Agent, error) {
+func (i *interceptor) authenticateAgent(bearerToken string, md metadata.MD) (*models.Agent, error) {
 	if strings.HasPrefix(bearerToken, "x-agt-") {
-		ag, err := pgagents.New().FetchOneByToken(bearerToken)
-		if err != nil || ag == nil {
+		ag, err := models.GetAgentByToken(bearerToken)
+		if err != nil {
 			md.Delete("authorization")
 			log.Debugf("invalid agent authentication (legacy auth), tokenlength=%v, client-metadata=%v, err=%v", len(bearerToken), md, err)
 			return nil, status.Errorf(codes.Unauthenticated, "invalid authentication")
@@ -276,8 +291,8 @@ func (i *interceptor) authenticateAgent(bearerToken string, md metadata.MD) (*pg
 		return nil, status.Errorf(codes.Unauthenticated, "invalid authentication")
 	}
 
-	ag, err := pgagents.New().FetchOneByToken(dsn.SecretKeyHash)
-	if err != nil || ag == nil {
+	ag, err := models.GetAgentByToken(dsn.SecretKeyHash)
+	if err != nil {
 		md.Delete("authorization")
 		log.Debugf("invalid agent authentication (dsn), tokenlength=%v, client-metadata=%v, err=%v", len(bearerToken), md, err)
 		return nil, status.Errorf(codes.Unauthenticated, "invalid authentication")
@@ -290,19 +305,30 @@ func (i *interceptor) authenticateAgent(bearerToken string, md metadata.MD) (*pg
 	return ag, nil
 }
 
-func parseBearerToken(md metadata.MD) (string, error) {
+func parseBearerToken(md metadata.MD) (string, bool, error) {
+	if md.Get(grpckey.ImpersonateAuthKeyHeaderKey) != nil {
+		// this is an impersonation request, the token is not a bearer token
+		return "", false, nil
+	}
 	t := md.Get("authorization")
 	if len(t) == 0 {
 		log.Debugf("missing authorization header, client-metadata=%v", md)
-		return "", status.Error(codes.Unauthenticated, "invalid authentication")
+		return "", false, status.Error(codes.Unauthenticated, "invalid authentication")
 	}
 
 	tokenValue := t[0]
 	tokenParts := strings.Split(tokenValue, " ")
 	if len(tokenParts) != 2 || tokenParts[0] != "Bearer" || tokenParts[1] == "" {
 		log.Debugf("authorization header in wrong format, client-metadata=%v", md)
-		return "", status.Error(codes.Unauthenticated, "invalid authentication")
+		return "", false, status.Error(codes.Unauthenticated, "invalid authentication")
 	}
 
-	return tokenParts[1], nil
+	// legacy api key format
+	parts := strings.Split(tokenParts[1], "|")
+	if _, err := uuid.Parse(parts[0]); err == nil {
+		return tokenParts[1], true, nil
+	}
+
+	// new api key format
+	return tokenParts[1], strings.HasPrefix(tokenParts[1], "xapi-"), nil
 }

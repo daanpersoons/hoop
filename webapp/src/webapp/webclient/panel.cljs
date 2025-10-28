@@ -12,29 +12,28 @@
    ["@codemirror/state" :as cm-state]
    ["@codemirror/view" :as cm-view]
    ["@heroicons/react/20/solid" :as hero-solid-icon]
-   ["@radix-ui/themes" :refer [Box Flex Spinner]]
+   ["@radix-ui/themes" :refer [Box Flex Spinner Tooltip Text]]
    ["@uiw/codemirror-theme-material" :refer [materialDark materialLight]]
    ["@uiw/react-codemirror" :as CodeMirror]
    ["allotment" :refer [Allotment]]
    ["codemirror-copilot" :refer [clearLocalCache inlineCopilot]]
+   ["lucide-react" :refer [Info]]
    [clojure.string :as cs]
    [re-frame.core :as rf]
    [reagent.core :as r]
    [webapp.formatters :as formatters]
-   [webapp.subs :as subs]
    [webapp.components.keyboard-shortcuts :as keyboard-shortcuts]
    [webapp.webclient.codemirror.extensions :as extensions]
-   [webapp.webclient.components.connections-list :as connections-list]
+   [webapp.webclient.components.connection-dialog :as connection-dialog]
    [webapp.webclient.components.header :as header]
    [webapp.webclient.components.language-select :as language-select]
-   [webapp.webclient.components.panels.connections :as connections-panel]
+   [webapp.webclient.components.panels.multiple-connections :as multiple-connections-panel]
    [webapp.webclient.components.panels.metadata :as metadata-panel]
-   [webapp.webclient.components.panels.runbooks :as runbooks-panel]
+   [webapp.webclient.components.panels.database-schema :as database-schema-panel]
    [webapp.webclient.components.side-panel :refer [with-panel]]
    [webapp.webclient.exec-multiples-connections.exec-list :as multiple-connections-exec-list-component]
    [webapp.webclient.log-area.main :as log-area]
-   [webapp.webclient.quickstart :as quickstart]
-   [webapp.webclient.runbooks.form :as runbooks-form]))
+   [webapp.webclient.quickstart :as quickstart]))
 
 (defn discover-connection-type [connection]
   (cond
@@ -56,8 +55,9 @@
         object (js->clj (.parse js/JSON item))]
     (or (get object "code") "")))
 
-(def ^:private timer (r/atom nil))
 (def ^:private code-saved-status (r/atom :saved)) ; :edited | :saved
+(def ^:private is-typing (r/atom false))
+(def ^:private typing-timer (r/atom nil))
 
 (defn- save-code-to-localstorage [code-string]
   (let [code-tmp-db {:date (.now js/Date)
@@ -66,13 +66,6 @@
     (.setItem js/localStorage :code-tmp-db code-tmp-db-json)
     (reset! code-saved-status :saved)))
 
-(defn- auto-save [^cm-view/ViewUpdate view-update script]
-  (when (.-docChanged view-update)
-    (reset! code-saved-status :edited)
-    (let [code-string (.toString (.-doc (.-state (.-view view-update))))]
-      (when @timer (js/clearTimeout @timer))
-      (reset! timer (js/setTimeout #(save-code-to-localstorage code-string) 1000))
-      (reset! script code-string))))
 
 (defmulti ^:private saved-status-el identity)
 (defmethod ^:private saved-status-el :saved [_]
@@ -89,43 +82,124 @@
     [:span {:class "text-xs italic"}
      "Edited"]]])
 
-(defn process-schema [tree schema-key prefix]
-  (reduce
-   (fn [acc table-key]
-     (let [qualified-key (if prefix
-                           (str schema-key "." table-key)
-                           table-key)]
-       (assoc acc qualified-key (keys (get (get (:schema-tree tree) schema-key) table-key)))))
-   {}
-   (keys (get (:schema-tree tree) schema-key))))
+(def current-sql-parser (r/atom nil))
 
-(defn convert-tree [tree]
-  (let [schema-keys (keys (:schema-tree tree))]
-    (cond
-      (> (count schema-keys) 1) (reduce
-                                 (fn [acc schema-key]
-                                   (merge acc (process-schema tree schema-key true)))
-                                 {}
-                                 schema-keys)
-      (<= (count schema-keys) 1) (process-schema tree (first schema-keys) false)
-      :else #js{})))
+(defn should-recreate-parser? [prev-lang current-lang]
+  (or (nil? prev-lang)
+      (not= prev-lang current-lang)))
 
-(defn- editor []
+(defn get-or-create-sql-parser [current-language]
+  (let [prev-parser-info (:info @current-sql-parser)
+        prev-lang (:language prev-parser-info)]
+
+    (if (should-recreate-parser? prev-lang current-language)
+      (let [basic-parser (case current-language
+                           "postgres" [(sql (.assign js/Object (.-dialect PostgreSQL) #js{}))]
+                           "mysql" [(sql (.assign js/Object (.-dialect MySQL) #js{}))]
+                           "mssql" [(sql (.assign js/Object (.-dialect MSSQL) #js{}))]
+                           "oracledb" [(sql (.assign js/Object (.-dialect PLSQL) #js{}))]
+                           "command-line" [(.define cm-language/StreamLanguage cm-shell/shell)]
+                           "javascript" [(.define cm-language/StreamLanguage cm-javascript/javascript)]
+                           "nodejs" [(.define cm-language/StreamLanguage cm-javascript/javascript)]
+                           "mongodb" [(.define cm-language/StreamLanguage cm-javascript/javascript)]
+                           "ruby-on-rails" [(.define cm-language/StreamLanguage cm-ruby/ruby)]
+                           "python" [(.define cm-language/StreamLanguage cm-python/python)]
+                           "clojure" [(.define cm-language/StreamLanguage cm-clojure/clojure)]
+                           "elixir" [(cm-elixir/elixir)]
+                           "" [(.define cm-language/StreamLanguage cm-shell/shell)]
+                           [(.define cm-language/StreamLanguage cm-shell/shell)])]
+
+        ;; Use basic parser
+        (reset! current-sql-parser {:parser basic-parser
+                                    :info {:language current-language}})
+
+        ;; Return basic parser
+        basic-parser)
+
+      (:parser @current-sql-parser))))
+
+(def editor-debounce-time 750)
+
+;; Optimization of the typing state update function
+(defn update-global-typing-state [is-typing?]
+  (when (not= @is-typing is-typing?)
+    (reset! is-typing is-typing?)
+    (aset js/window "is_typing" is-typing?)))
+
+(defn create-codemirror-extensions [parser
+                                    keymap
+                                    feature-ai-ask
+                                    is-one-connection-selected?
+                                    connection-subtype
+                                    is-template-ready?]
+
+  (let [extensions
+        (concat
+         [(.of cm-view/keymap (clj->js keymap))]
+         (when (and (= feature-ai-ask "enabled")
+                    is-one-connection-selected?)
+           [(inlineCopilot
+             #js{:getSuggestions (fn [prefix suffix]
+                                   (extensions/fetch-autocomplete
+                                    connection-subtype
+                                    prefix
+                                    suffix))
+                 :debounceMs 1200
+                 :maxPrefixLength 500
+                 :maxSuffixLength 500})])
+         parser
+         (when is-template-ready?
+           [(.of (.-editable cm-view/EditorView) false)
+            (.of (.-readOnly cm-state/EditorState) true)]))]
+
+    extensions))
+
+(def codemirror-editor
+  (r/create-class
+   {:display-name "OptimizedCodeMirror"
+
+    :should-component-update
+    (fn [_ [_ old-props] [_ new-props]]
+      (let [should-update (or
+                           (not= (:value old-props) (:value new-props))
+                           (not= (:theme old-props) (:theme new-props))
+                           (not= (hash (:extensions old-props)) (hash (:extensions new-props))))]
+        should-update))
+
+    :reagent-render
+    (fn [{:keys [value theme extensions on-change]}]
+      [:> CodeMirror/default
+       {:value value
+        :height "100%"
+        :className "h-full text-sm"
+        :theme theme
+        :basicSetup #js{:defaultKeymap false}
+        :onChange on-change
+        :extensions (clj->js extensions)}])}))
+
+(defn connection-state-indicator [dark-mode? command]
+  [:> Box {:class (str "p-3 " (if dark-mode? "bg-[#2e3235]" "bg-[#FAFAFA]"))}
+
+   [:> Flex {:align "center" :gap "1"}
+    [:> Box {:class "px-2 rounded-md bg-[--gray-10]"}
+     [:> Text {:as "span" :size "1" :weight "medium" :class "text-gray-1"} "stdin → "]
+     [:> Text {:as "span" :size "1" :weight "medium" :class "text-gray-1"} (cs/join " " command)]]
+    [:> Tooltip {:content (str "Your script streams to " (cs/join " " command) " via stdin")}
+     [:> Info {:class "shrink-0 text-gray-11"}]]]])
+
+
+
+(defn editor []
   (let [user (rf/subscribe [:users->current-user])
+        gateway-info (rf/subscribe [:gateway->info])
         db-connections (rf/subscribe [:connections])
-        selected-connection (rf/subscribe [:connections/selected])
-        multi-selected-connections (rf/subscribe [:connection-selection/selected])
-        database-schema (rf/subscribe [::subs/database-schema])
-        selected-template (rf/subscribe [:runbooks-plugin->selected-runbooks])
-        multi-exec (rf/subscribe [:multi-exec/modal])
+        multi-selected-connections (rf/subscribe [:multiple-connections/selected])
+        multi-exec (rf/subscribe [:multiple-connection-execution/modal])
+        primary-connection (rf/subscribe [:primary-connection/selected])
+        active-panel (rf/subscribe [:webclient->active-panel])
 
-        active-panel (r/atom nil)
-        multi-run-panel? (r/atom false)
         dark-mode? (r/atom (= (.getItem js/localStorage "dark-mode") "true"))
-
-        vertical-pane-sizes (mapv js/parseInt
-                                  (cs/split
-                                   (or (.getItem js/localStorage "editor-vertical-pane-sizes") "270,950") ","))
+        db-schema-collapsed? (r/atom false)
         horizontal-pane-sizes (mapv js/parseInt
                                     (cs/split
                                      (or (.getItem js/localStorage "editor-horizontal-pane-sizes") "650,210") ","))
@@ -133,30 +207,39 @@
         metadata (r/atom [])
         metadata-key (r/atom "")
         metadata-value (r/atom "")]
-    (rf/dispatch [:runbooks-plugin->clear-active-runbooks])
+    (rf/dispatch [:gateway->get-info])
 
     (fn [{:keys [script-output]}]
-      (let [is-one-connection-selected? (= 0 (count @multi-selected-connections))
+      (let [is-one-connection-selected? @(rf/subscribe [:execution/is-single-mode])
             feature-ai-ask (or (get-in @user [:data :feature_ask_ai]) "disabled")
-            current-connection @selected-connection
-            connection-name (:name current-connection)
+            current-connection @primary-connection
             connection-type (discover-connection-type current-connection)
+            disabled-download (-> @gateway-info :data :disable_sessions_download)
+            exec-enabled? (= "enabled" (:access_mode_exec current-connection))
+            no-connection-selected? (and (empty? @multi-selected-connections)
+                                         (not @primary-connection))
+            run-disabled? (or (not exec-enabled?) no-connection-selected?)
             reset-metadata (fn []
                              (reset! metadata [])
                              (reset! metadata-key "")
                              (reset! metadata-value ""))
             keymap [{:key "Mod-Enter"
-                     :run (fn [_]
-                            (rf/dispatch [:editor-plugin/submit-task {:script @script}]))
+                     :run (fn [^cm-state/StateCommand config]
+                            (when-not run-disabled?
+                              (let [state (.-state config)
+                                    doc (.-doc state)]
+                                (rf/dispatch [:editor-plugin/submit-task
+                                              {:script (.sliceString ^cm-state/Text doc 0 (.-length doc))}]))))
                      :preventDefault true}
                     {:key "Mod-Shift-Enter"
                      :run (fn [^cm-state/StateCommand config]
-                            (let [ranges (.-ranges (.-selection (.-state config)))
-                                  from (.-from (first ranges))
-                                  to (.-to (first ranges))]
-                              (rf/dispatch [:editor-plugin/submit-task
-                                            {:script
-                                             (.sliceString ^cm-state/Text (.-doc (.-state config)) from to)}])))
+                            (when-not run-disabled?
+                              (let [ranges (.-ranges (.-selection (.-state config)))
+                                    from (.-from (first ranges))
+                                    to (.-to (first ranges))]
+                                (rf/dispatch [:editor-plugin/submit-task
+                                              {:script
+                                               (.sliceString ^cm-state/Text (.-doc (.-state config)) from to)}]))))
                      :preventDefault true}
                     {:key "Alt-ArrowLeft"
                      :mac "Ctrl-ArrowLeft"
@@ -181,142 +264,109 @@
                     {:key "Shift-Mod-\\" :run cm-commands/cursorMatchingBracket}
                     {:key "Mod-/" :run cm-commands/toggleComment}
                     {:key "Alt-A" :run cm-commands/toggleBlockComment}]
-            current-schema (get-in @database-schema [:data connection-name])
             language-info @(rf/subscribe [:editor-plugin/language])
             current-language (or (:selected language-info) (:default language-info))
-            language-parser-case (let [subtype (:subtype current-connection)
-                                       databse-schema-sanitized (if (= (:status current-schema) :success)
-                                                                  current-schema
-                                                                  {:status :failure :raw "" :schema-tree []})
-                                       schema (if (and is-one-connection-selected?
-                                                       (= subtype (:type current-schema)))
-                                                #js{:schema (clj->js (convert-tree databse-schema-sanitized))}
-                                                #js{})]
-                                   (case current-language
-                                     "postgres" [(sql
-                                                  (.assign js/Object (.-dialect PostgreSQL)
-                                                           schema))]
-                                     "mysql" [(sql
-                                               (.assign js/Object (.-dialect MySQL)
-                                                        schema))]
-                                     "mssql" [(sql
-                                               (.assign js/Object (.-dialect MSSQL)
-                                                        schema))]
-                                     "oracledb" [(sql
-                                                  (.assign js/Object (.-dialect PLSQL)
-                                                           schema))]
-                                     "command-line" [(.define cm-language/StreamLanguage cm-shell/shell)]
-                                     "javascript" [(.define cm-language/StreamLanguage cm-javascript/javascript)]
-                                     "nodejs" [(.define cm-language/StreamLanguage cm-javascript/javascript)]
-                                     "mongodb" [(.define cm-language/StreamLanguage cm-javascript/javascript)]
-                                     "ruby-on-rails" [(.define cm-language/StreamLanguage cm-ruby/ruby)]
-                                     "python" [(.define cm-language/StreamLanguage cm-python/python)]
-                                     "clojure" [(.define cm-language/StreamLanguage cm-clojure/clojure)]
-                                     "elixir" [(cm-elixir/elixir)]
-                                     "" [(.define cm-language/StreamLanguage cm-shell/shell)]
-                                     [(.define cm-language/StreamLanguage cm-shell/shell)]))
-            show-tree? (fn [connection]
-                         (or (= (:type connection) "mysql-csv")
-                             (= (:type connection) "postgres-csv")
-                             (= (:type connection) "mongodb")
-                             (= (:type connection) "postgres")
-                             (= (:type connection) "mysql")
-                             (= (:type connection) "sql-server-csv")
-                             (= (:type connection) "mssql")
-                             (= (:type connection) "oracledb")
-                             (= (:type connection) "database")))
-            panel-content (case @active-panel
-                            :runbooks (runbooks-panel/main)
-                            :metadata (metadata-panel/main {:metadata metadata
-                                                            :metadata-key metadata-key
-                                                            :metadata-value metadata-value})
-                            nil)]
+            language-parser-case (get-or-create-sql-parser current-language)
+
+            codemirror-exts (create-codemirror-extensions
+                             language-parser-case
+                             keymap
+                             feature-ai-ask
+                             is-one-connection-selected?
+                             (:subtype current-connection)
+                             false)
+
+            optimized-change-handler (fn [value _]
+                                       (reset! script value)
+                                       (reset! code-saved-status :edited)
+                                       (update-global-typing-state true)
+                                       (when @typing-timer (js/clearTimeout @typing-timer))
+                                       (reset! typing-timer
+                                               (js/setTimeout
+                                                (fn []
+                                                  (update-global-typing-state false)
+                                                  (save-code-to-localstorage value))
+                                                editor-debounce-time)))
+
+            panel-content (fn [active-panel]
+                            (case active-panel
+                              :metadata {:title "Metadata"
+                                         :content [metadata-panel/main {:metadata metadata
+                                                                        :metadata-key metadata-key
+                                                                        :metadata-value metadata-value}]}
+                              :multiple-connections {:content [multiple-connections-panel/main dark-mode?]}
+                              nil))]
 
         (if (and (empty? (:results @db-connections))
                  (not (:loading @db-connections)))
           [quickstart/main]
 
-          [:> Box {:class (str "h-full bg-gray-2 overflow-hidden "
-                               (when @dark-mode?
-                                 "dark"))}
+          [:<>
+           [:> Box {:class (str "h-full bg-gray-2 overflow-hidden "
+                                (when @dark-mode?
+                                  "dark"))}
+            [connection-dialog/connection-dialog]
 
-           [header/main
-            active-panel
-            multi-run-panel?
-            dark-mode?
-            #(rf/dispatch [:editor-plugin/submit-task {:script @script}])]
-           [with-panel
-            (boolean @active-panel)
-            [:> Box {:class "flex h-terminal-content overflow-hidden"}
-             [:> Allotment {:defaultSizes vertical-pane-sizes
-                            :onDragEnd #(.setItem js/localStorage "editor-vertical-pane-sizes" (str %))}
-              [:> (.-Pane Allotment) {:minSize 270}
-               [:aside {:class "h-full flex flex-col gap-8 border-r-2 border-[--gray-3] overflow-auto pb-16"}
-                (if @multi-run-panel?
-                  [connections-panel/main dark-mode?]
-                  [connections-list/main dark-mode? (show-tree? current-connection)])]]
+            [header/main
+             dark-mode?
+             #(rf/dispatch [:editor-plugin/submit-task {:script @script}])]
 
-              [:> Allotment {:defaultSizes horizontal-pane-sizes
-                             :onDragEnd #(.setItem js/localStorage "editor-horizontal-pane-sizes" (str %))
-                             :vertical true}
-               (if (= (:status @selected-template) :ready)
-                 [:section {:class "relative h-full p-3 overflow-auto"}
-                  [runbooks-form/main {:runbook @selected-template
-                                       :preselected-connection (:name current-connection)
-                                       :selected-connections (conj @multi-selected-connections current-connection)}]]
+            [with-panel
+             (boolean @active-panel)
+             [:> Box {:class "flex h-terminal-content overflow-hidden"}
+              [:> Allotment {:key (str "compact-allotment-" @db-schema-collapsed?)
+                             :separator false}
 
+               (when (and current-connection
+                          (or (= "database" (:type current-connection))
+                              (= "dynamodb" (:subtype current-connection))
+                              (= "cloudwatch" (:subtype current-connection))))
+                 [:> (.-Pane Allotment) {:minSize (if @db-schema-collapsed? 64 250)
+                                         :maxSize (if @db-schema-collapsed? 64 400)}
+                  [database-schema-panel/main {:connection current-connection
+                                               :collapsed? @db-schema-collapsed?
+                                               :on-toggle-collapse #(swap! db-schema-collapsed? not)}]])
 
+               [:> (.-Pane Allotment)
+                [:> Allotment {:defaultSizes horizontal-pane-sizes
+                               :onDragEnd #(.setItem js/localStorage "editor-horizontal-pane-sizes" (str %))
+                               :vertical true}
+                 [:div {:class "relative w-full h-full"}
+                  [:div {:class "h-full flex flex-col"}
+                   (when (and (empty? @multi-selected-connections)
+                              (= "custom" (:type current-connection)))
+                     [connection-state-indicator @dark-mode? (:command current-connection)])
+                   [codemirror-editor
+                    {:value @script
+                     :theme (if @dark-mode?
+                              materialDark
+                              materialLight)
+                     :extensions codemirror-exts
+                     :on-change optimized-change-handler}]]]
 
-                 [:> CodeMirror/default {:value @script
-                                         :height "100%"
-                                         :className "h-full text-sm"
-                                         :theme (if @dark-mode?
-                                                  materialDark
-                                                  materialLight)
-                                         :basicSetup #js{:defaultKeymap false}
-                                         :extensions (clj->js
-                                                      (concat
-                                                       (when (and (= feature-ai-ask "enabled")
-                                                                  is-one-connection-selected?)
-                                                         [(inlineCopilot
-                                                           (fn [prefix suffix]
-                                                             (extensions/fetch-autocomplete
-                                                              (:subtype current-connection)
-                                                              prefix
-                                                              suffix
-                                                              (:raw current-schema))))])
-                                                       [(.of cm-view/keymap (clj->js keymap))]
-                                                       language-parser-case
-                                                       (when (= (:status @selected-template) :ready)
-                                                         [(.of (.-editable cm-view/EditorView) false)
-                                                          (.of (.-readOnly cm-state/EditorState) true)])))
-                                         :onUpdate #(auto-save % script)}])
+                 [:> Flex {:direction "column" :justify "between" :class "h-full"}
+                  [log-area/main
+                   connection-type
+                   is-one-connection-selected?
+                   @dark-mode?
+                   (not disabled-download)]
 
+                  [:div {:class "bg-gray-1"}
+                   [:footer {:class "flex justify-between items-center p-2 gap-small"}
+                    [:div {:class "flex items-center gap-small"}
+                     [saved-status-el @code-saved-status]
+                     (when (:execution_time (:data @script-output))
+                       [:div {:class "flex items-center gap-small"}
+                        [:> hero-solid-icon/ClockIcon {:class "h-4 w-4 shrink-0 text-white"
+                                                       :aria-hidden "true"}]
+                        [:span {:class "text-xs text-gray-11"}
+                         (str "Last execution time " (formatters/time-elapsed (:execution_time (:data @script-output))))]])]
+                    [:div {:class "flex-end items-center gap-regular pr-4 flex"}
+                     [:div {:class "mr-3"}
+                      [keyboard-shortcuts/keyboard-shortcuts-button]]
+                     [language-select/main current-connection]]]]]]]]]
 
-               [:> Flex {:direction "column" :justify "between" :class "h-full"}
-                [log-area/main
-                 connection-type
-                 is-one-connection-selected?
-                 (show-tree? current-connection)
-                 @dark-mode?]
-
-                [:div {:class "bg-gray-1"}
-                 [:footer {:class "flex justify-between items-center p-2 gap-small"}
-                  [:div {:class "flex items-center gap-small"}
-                   [saved-status-el @code-saved-status]
-                   (when (:execution_time (:data @script-output))
-                     [:div {:class "flex items-center gap-small"}
-                      [:> hero-solid-icon/ClockIcon {:class "h-4 w-4 shrink-0 text-white"
-                                                     :aria-hidden "true"}]
-                      [:span {:class "text-xs text-gray-11"}
-                       (str "Last execution time " (formatters/time-elapsed (:execution_time (:data @script-output))))]])]
-                  [:div {:class "flex-end items-center gap-regular pr-4 flex"}
-                   [:div {:class "mr-3"} 
-                    [keyboard-shortcuts/keyboard-shortcuts-button]]
-                   [language-select/main current-connection]]]]]]]]
-            panel-content]
-
-
+             (panel-content @active-panel)]]
 
            (when (seq (:data @multi-exec))
              [multiple-connections-exec-list-component/main
@@ -331,18 +381,24 @@
                    @multi-selected-connections)
               reset-metadata])])))))
 
-(defn main []
-  (let [script-response (rf/subscribe [:editor-plugin->script])]
-    (rf/dispatch [:editor-plugin->clear-script])
-    (rf/dispatch [:editor-plugin->clear-connection-script])
-    (rf/dispatch [:ask-ai->clear-ai-responses])
-    (rf/dispatch [:connections->get-connections])
-    (rf/dispatch [:audit->clear-session])
-    (rf/dispatch [:plugins->get-my-plugins])
-    (rf/dispatch [:jira-templates->get-all])
-    (rf/dispatch [:jira-integration->get])
-    (rf/dispatch [:search/clear-term])
+(def main
+  (r/create-class
+   {:component-will-unmount
+    (fn [_this]
+      (js/window.Intercom "update" #js{:hide_default_launcher false}))
+
+    :reagent-render
     (fn []
-      (clearLocalCache)
-      (rf/dispatch [:editor-plugin->get-run-connection-list])
-      [editor {:script-output script-response}])))
+      (let [script-response (rf/subscribe [:editor-plugin->script])]
+        (rf/dispatch [:editor-plugin->clear-script])
+        (rf/dispatch [:editor-plugin->clear-connection-script])
+        (rf/dispatch [:audit->clear-session])
+        (rf/dispatch [:plugins->get-my-plugins])
+        (rf/dispatch [:jira-templates->get-all])
+        (rf/dispatch [:jira-integration->get])
+        (rf/dispatch [:search/clear-term])
+
+        (js/window.Intercom "update" #js{:hide_default_launcher true})
+        (fn []
+          (clearLocalCache)
+          [editor {:script-output script-response}])))}))

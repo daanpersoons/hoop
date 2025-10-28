@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"encoding/json"
 	"fmt"
 	"io"
 	reflect "reflect"
@@ -40,7 +41,16 @@ type (
 		ClientArgs     []string
 		ClientVerb     string
 		ClientOrigin   string
-		DLPInfoTypes   []string
+
+		DlpProvider              string
+		DlpMode                  string
+		DLPInfoTypes             []string
+		DlpGcpRawCredentialsJSON string
+		DlpPresidioAnalyzerURL   string
+		DlpPresidioAnonymizerURL string
+
+		DataMaskingEntityTypesData json.RawMessage
+		GuardRailRules             json.RawMessage
 	}
 
 	// TODO: remove it later, kept for compatibility issues
@@ -164,11 +174,20 @@ func ToConnectionType(connectionType, subtype string) ConnectionType {
 			return ConnectionType(ConnectionTypeHttpProxy)
 		case "ssh":
 			return ConnectionType(ConnectionTypeSSH)
+		case "rdp":
+			return ConnectionType(ConnectionTypeRDP)
 		default:
 			return ConnectionType(ConnectionTypeCommandLine)
 		}
 	case "custom":
-		return ConnectionType(ConnectionTypeCommandLine)
+		switch subtype {
+		case "dynamodb":
+			return ConnectionType(ConnectionTypeDynamoDB)
+		case "cloudwatch":
+			return ConnectionType(ConnectionTypeCloudWatch)
+		default:
+			return ConnectionType(ConnectionTypeCommandLine)
+		}
 	case "database":
 		switch subtype {
 		case "postgres":

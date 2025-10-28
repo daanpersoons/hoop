@@ -1,9 +1,16 @@
 package cmd
 
 import (
+	"os"
+
 	"github.com/hoophq/hoop/agent"
+	"github.com/hoophq/hoop/common/log"
 	"github.com/hoophq/hoop/gateway"
 	"github.com/spf13/cobra"
+)
+
+var (
+	outputFormat string
 )
 
 var startCmd = &cobra.Command{
@@ -16,6 +23,44 @@ var startAgentCmd = &cobra.Command{
 	Short:        "Runs the agent component",
 	SilenceUsage: false,
 	Run: func(cmd *cobra.Command, args []string) {
+		// Use verbose format when global debug flag is enabled
+		if debugFlag && outputFormat == "" {
+			outputFormat = "verbose"
+		}
+
+		switch outputFormat {
+		case "human":
+			os.Setenv("LOG_ENCODING", "human")
+		case "verbose":
+			os.Setenv("LOG_ENCODING", "verbose")
+		case "console":
+			os.Setenv("LOG_ENCODING", "console")
+		case "json":
+			os.Setenv("LOG_ENCODING", "json")
+		default:
+			// Auto-detect format based on output destination
+			if fileInfo, err := os.Stdout.Stat(); err == nil {
+				if (fileInfo.Mode() & os.ModeCharDevice) != 0 {
+					os.Setenv("LOG_ENCODING", "human")
+				} else {
+					os.Setenv("LOG_ENCODING", "json")
+				}
+			} else {
+				// Fallback to JSON if we can't determine output type
+				os.Setenv("LOG_ENCODING", "json")
+			}
+		}
+
+		log.ReinitializeLogger()
+
+		//TODO for now we will start the rust agent if hoop_rs binary is found
+		// if something goes wrong we will fallback we will skill but alwys run the go agent
+		// check if gateway env is set
+		if os.Getenv("HOOP_GATEWAY_URL") != "" {
+			RunAgentrs()
+		} else {
+			log.Info("HOOP_GATEWAY_URL not set, skipping hoop_rs agent startup")
+		}
 		agent.Run()
 	},
 }
@@ -30,6 +75,9 @@ var startGatewayCmd = &cobra.Command{
 }
 
 func init() {
+	startAgentCmd.Flags().StringVar(&outputFormat, "format", os.Getenv("LOG_ENCODING"),
+		"Output format: auto, human, verbose, console, json")
+
 	startCmd.AddCommand(startAgentCmd)
 	startCmd.AddCommand(startGatewayCmd)
 	rootCmd.AddCommand(startCmd)

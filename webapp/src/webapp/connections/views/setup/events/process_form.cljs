@@ -1,6 +1,7 @@
 (ns webapp.connections.views.setup.events.process-form
   (:require
    [clojure.string :as str]
+   [re-frame.core :as rf]
    [webapp.connections.constants :as constants]
    [webapp.connections.helpers :as helpers]
    [webapp.connections.views.setup.tags-utils :as tags-utils]))
@@ -75,6 +76,24 @@
                                                            (seq database-credentials))]
                          (concat credentials-as-env-vars env-vars))
 
+                       (and (= ui-type "custom") connection-subtype (get-in db [:connection-setup :metadata-credentials]))
+                       (let [metadata-credentials (get-in db [:connection-setup :metadata-credentials])
+                             connections-metadata @(rf/subscribe [:connections->metadata])
+                             connection (->> (:connections connections-metadata)
+                                             (filter #(= (get-in % [:resourceConfiguration :subtype]) connection-subtype))
+                                             first)
+                             credentials-config (get-in connection [:resourceConfiguration :credentials])
+                             credentials-as-env-vars (mapv (fn [[field-key field-value]]
+                                                             (let [form-key-normalized (str/lower-case (str/replace (name field-key) #"[^a-zA-Z0-9]" ""))
+                                                                   original-config (->> credentials-config
+                                                                                        (filter #(= (str/lower-case (str/replace (:name %) #"[^a-zA-Z0-9]" ""))
+                                                                                                    form-key-normalized))
+                                                                                        first)]
+                                                               {:key (or (:name original-config) (name field-key))
+                                                                :value field-value}))
+                                                           (seq metadata-credentials))]
+                         (concat credentials-as-env-vars env-vars))
+
                        (= connection-subtype "tcp")
                        (let [network-credentials (get-in db [:connection-setup :network-credentials])
                              tcp-env-vars [{:key "HOST" :value (:host network-credentials)}
@@ -83,7 +102,9 @@
 
                        (= connection-subtype "httpproxy")
                        (let [network-credentials (get-in db [:connection-setup :network-credentials])
-                             http-env-vars [{:key "REMOTE_URL" :value (:remote_url network-credentials)}]
+                             insecure-value (if (:insecure network-credentials) "true" "false")
+                             http-env-vars [{:key "REMOTE_URL" :value (:remote_url network-credentials)}
+                                            {:key "INSECURE" :value insecure-value}]
                              headers (get-in db [:connection-setup :credentials :environment-variables] [])
                              processed-headers (process-http-headers headers)]
                          (concat http-env-vars processed-headers))
@@ -114,24 +135,42 @@
         effective-access-modes (merge default-access-modes access-modes)
 
         default-database-schema true
-        effective-database-schema (or (:database-schema config) default-database-schema)
+        effective-database-schema (if (nil? (:database-schema config))
+                                    default-database-schema
+                                    (:database-schema config))
 
         command-string (get-in db [:connection-setup :command])
-        payload {:type api-type
-                 :subtype (when-not (= api-type "custom")
+        command-args (get-in db [:connection-setup :command-args] [])
+        command-args-from-metadata (get-in db [:connection-setup :metadata-command-args] [])
+        command-array (if (seq command-args)
+                        (mapv #(get % "value") command-args)
+
+                        ;; Deprecated
+                        (when-not (empty? command-string)
+                          (or (re-seq #"'.*?'|\".*?\"|\S+|\t" command-string) [])))
+        resource-subtype-override (get-in db [:connection-setup :resource-subtype-override])
+        effective-subtype (if (and (= ui-type "custom")
+                                   resource-subtype-override
+                                   (seq resource-subtype-override))
+                            resource-subtype-override
                             connection-subtype)
+        payload {:type api-type
+                 :subtype effective-subtype
                  :name connection-name
                  :agent_id agent-id
                  :connection_tags tags
                  :tags old-tags
                  :secret secret
-                 :command (if (= api-type "database")
-                            []
-                            (when-not (empty? command-string)
-                              (or (re-seq #"'.*?'|\".*?\"|\S+|\t" command-string) [])))
+                 :command (cond
+                            (= api-type "database") []
+                            (seq command-args-from-metadata) command-args-from-metadata
+                            :else
+                            command-array)
                  :guardrail_rules guardrails-processed
                  :jira_issue_template_id jira-template-id-processed
-                 :access_schema (or (when (= api-type "database")
+                 :access_schema (or (when (or (= api-type "database")
+                                              (= connection-subtype "dynamodb")
+                                              (= connection-subtype "cloudwatch"))
                                       (if effective-database-schema
                                         "enabled"
                                         "disabled"))
@@ -227,9 +266,10 @@
    "authorized_server_keys" (get credentials "authorized_server_keys")})
 
 (defn extract-http-credentials
-  "Retrieves remote_url from secrets for http credentials"
+  "Retrieves remote_url and insecure flag from secrets for http credentials"
   [credentials]
-  {:remote_url (get credentials "remote_url")})
+  {:remote_url (get credentials "remote_url")
+   :insecure (= (get credentials "insecure") "true")})
 
 (defn process-connection-for-update
   "Process an existing connection for the format used in the update form"
@@ -244,10 +284,16 @@
         ssh-credentials (when (and (= (:type connection) "application")
                                    (= (:subtype connection) "ssh"))
                           (extract-ssh-credentials credentials))
-        ;; Extrair tags no formato correto
+        ssh-auth-method (when ssh-credentials
+                          (cond
+                            (and (not (empty? (get ssh-credentials "authorized_server_keys")))
+                                 (empty? (get ssh-credentials "pass"))) "key"
+                            (and (not (empty? (get ssh-credentials "pass")))
+                                 (empty? (get ssh-credentials "authorized_server_keys"))) "password"
+                            (not (empty? (get ssh-credentials "authorized_server_keys"))) "key"
+                            :else "password"))
         connection-tags (when-let [tags (:connection_tags connection)]
                           (cond
-                           ;; Se for um mapa, converte para array de {:key k :value v}
                             (map? tags)
                             (mapv (fn [[k v]]
                                     (let [key (str (namespace k) "/" (name k))
@@ -257,56 +303,64 @@
                                                        key)]
                                       {:key parsed-key :value v :label (tags-utils/extract-label parsed-key)})) tags)
 
-                           ;; Se for array simples, converte cada item para {:key item :value ""}
                             (sequential? tags)
                             (mapv (fn [tag]
                                     (if (map? tag)
-                                    ;; Se já for no formato {:key k :value v}, usa diretamente
                                       tag
-                                    ;; Senão, é um valor simples que vira chave
                                       {:key tag :value ""}))
                                   tags)
 
                             :else []))
 
-        ;; Filtrar tags inválidas
         valid-tags (filter-valid-tags connection-tags)
 
-        ;; Processar environment variables para HTTP
         http-env-vars (when (and (= (:type connection) "application")
                                  (= (:subtype connection) "httpproxy"))
                         (let [headers (process-connection-envvars (:secret connection) "envvar")
-                              _ (println "headers" headers)
                               remote-url? #(= (:key %) "REMOTE_URL")
+                              insecure? #(= (:key %) "INSECURE")
                               header? #(str/starts-with? % "HEADER_")
-                              processed-headers (map (fn [{:keys [key value]}]
-                                                       {:key (if (header? key)
-                                                               (str/replace key "HEADER_" "")
-                                                               key)
-                                                        :value value})
-                                                     (remove remote-url? headers))]
-                          processed-headers))]
+                              processed-headers (mapv (fn [{:keys [key value]}]
+                                                        {:key (if (header? key)
+                                                                (str/replace key "HEADER_" "")
+                                                                key)
+                                                         :value value})
+                                                      (->> headers
+                                                           (remove remote-url?)
+                                                           (remove insecure?)))]
+                          processed-headers))
 
-    {:type (:type connection)
-     :subtype (:subtype connection)
+        connection-type (:type connection)
+        connection-subtype (:subtype connection)
+        is-custom-with-override? (and (= connection-type "custom")
+                                      (contains? #{"dynamodb" "cloudwatch"} connection-subtype))
+        resource-subtype-override (when is-custom-with-override? connection-subtype)]
+
+    {:type connection-type
+     :subtype (if is-custom-with-override? "custom" connection-subtype)
      :name (:name connection)
      :agent-id (:agent_id connection)
-     :database-credentials (when (= (:type connection) "database") credentials)
+     :resource-subtype-override resource-subtype-override
+     :database-credentials (when (= connection-type "database") credentials)
      :network-credentials (or network-credentials http-credentials)
      :ssh-credentials ssh-credentials
+     :ssh-auth-method (or ssh-auth-method "password")
      :command (if (empty? (:command connection))
-                (get constants/connection-commands (:subtype connection))
+                (get constants/connection-commands connection-subtype)
                 (str/join " " (:command connection)))
+     :command-args (if (empty? (:command connection))
+                     []
+                     (mapv #(hash-map "value" % "label" %) (:command connection)))
      :credentials {:environment-variables (cond
-                                            (= (:type connection) "custom")
+                                            (= connection-type "custom")
                                             (process-connection-envvars (:secret connection) "envvar")
 
-                                            (and (= (:type connection) "application")
-                                                 (= (:subtype connection) "httpproxy"))
+                                            (and (= connection-type "application")
+                                                 (= connection-subtype "httpproxy"))
                                             http-env-vars
 
                                             :else [])
-                   :configuration-files (when (= (:type connection) "custom")
+                   :configuration-files (when (= connection-type "custom")
                                           (process-connection-envvars (:secret connection) "filesystem"))}
      :tags {:data valid-tags}
      :old-tags (:tags connection)
@@ -321,11 +375,11 @@
               :access-modes {:runbooks (= (:access_mode_runbooks connection) "enabled")
                              :native (= (:access_mode_connect connection) "enabled")
                              :web (= (:access_mode_exec connection) "enabled")}
-              :guardrails (if (empty? (:guardrail_rules connection))
-                            []
+              :guardrails (if (seq (:guardrail_rules connection))
                             (transform-filtered-guardrails-selected
                              guardrails-list
-                             (:guardrail_rules connection)))
+                             (:guardrail_rules connection))
+                            [])
               :jira-template-id (if (:jira_issue_template_id connection)
                                   (transform-filtered-jira-template-selected
                                    jira-templates-list

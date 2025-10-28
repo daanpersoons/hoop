@@ -7,7 +7,6 @@ import (
 	"github.com/hoophq/hoop/common/memory"
 	pb "github.com/hoophq/hoop/common/proto"
 	"github.com/hoophq/hoop/gateway/models"
-	"github.com/hoophq/hoop/gateway/pgrest"
 	"github.com/hoophq/hoop/gateway/transport/connectionstatus"
 	plugintypes "github.com/hoophq/hoop/gateway/transport/plugins/types"
 	streamtypes "github.com/hoophq/hoop/gateway/transport/streamclient/types"
@@ -34,7 +33,7 @@ type AgentStream struct {
 	context        context.Context
 	cancelFn       context.CancelCauseFunc
 	connectionName string
-	agent          pgrest.Agent
+	agent          models.Agent
 	metadata       metadata.MD
 }
 
@@ -45,7 +44,7 @@ func GetAgentStream(streamAgentID streamtypes.ID) *AgentStream {
 }
 
 func IsAgentOnline(streamAgentID streamtypes.ID) bool { return GetAgentStream(streamAgentID) != nil }
-func NewAgent(a pgrest.Agent, s pb.Transport_ConnectServer) *AgentStream {
+func NewAgent(a models.Agent, s pb.Transport_ConnectServer) *AgentStream {
 	streamCtx := s.Context()
 	ctx, cancelFn := context.WithCancelCause(streamCtx)
 	md, _ := metadata.FromIncomingContext(streamCtx)
@@ -81,7 +80,10 @@ func (s *AgentStream) validate() error {
 		if s.connectionName == "" {
 			return status.Error(codes.FailedPrecondition, "missing connection-name attribute")
 		}
-		conn, err := models.GetConnectionByNameOrID(s.GetOrgID(), s.connectionName)
+		// It is an internal operation, it must be able
+		// to get the connectinon without any access control group validation
+		adminCtx := models.NewAdminContext(s.GetOrgID())
+		conn, err := models.GetConnectionByNameOrID(adminCtx, s.connectionName)
 		if err != nil || conn == nil {
 			return status.Error(codes.Internal, fmt.Sprintf("failed validating connection, reason=%v", err))
 		}
@@ -98,9 +100,9 @@ func (s *AgentStream) StreamAgentID() streamtypes.ID {
 }
 
 func (s *AgentStream) GetOrgID() string       { return s.agent.OrgID }
-func (s *AgentStream) GetOrgName() string     { return s.agent.Org.Name }
 func (s *AgentStream) AgentID() string        { return s.agent.ID }
 func (s *AgentStream) AgentName() string      { return s.agent.Name }
+func (s *AgentStream) AgentVersion() string   { return s.agent.GetMeta("version") }
 func (s *AgentStream) ConnectionName() string { return s.connectionName }
 func (s *AgentStream) String() string         { return s.agent.String() }
 func (s *AgentStream) Save() (err error) {
@@ -119,7 +121,7 @@ func (s *AgentStream) Save() (err error) {
 		}
 	}()
 
-	return connectionstatus.SetOnline(s, s.StreamAgentID(), s.parseDefaultMetadata())
+	return connectionstatus.SetOnline(s.GetOrgID(), s.StreamAgentID(), s.parseDefaultMetadata())
 }
 
 func (s *AgentStream) Close(pctx plugintypes.Context, errMsg error) error {
@@ -129,7 +131,7 @@ func (s *AgentStream) Close(pctx plugintypes.Context, errMsg error) error {
 		return nil
 	}
 	agentStore.Del(streamAgentID)
-	_ = connectionstatus.SetOffline(s, s.StreamAgentID(), s.parseDefaultMetadata())
+	_ = connectionstatus.SetOffline(s.GetOrgID(), s.StreamAgentID(), s.parseDefaultMetadata())
 	disconnectProxiesByAgent(pctx, errMsg)
 	return nil
 }

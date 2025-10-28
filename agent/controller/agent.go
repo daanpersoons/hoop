@@ -15,6 +15,7 @@ import (
 	"github.com/getsentry/sentry-go"
 	"github.com/hoophq/hoop/agent/config"
 	"github.com/hoophq/hoop/agent/controller/system/dbprovisioner"
+	"github.com/hoophq/hoop/agent/controller/system/runbookhook"
 	"github.com/hoophq/hoop/agent/secretsmanager"
 	term "github.com/hoophq/hoop/agent/terminal"
 	"github.com/hoophq/hoop/common/log"
@@ -160,6 +161,9 @@ func (a *Agent) Run() error {
 		// system
 		case pbsystem.ProvisionDBRolesRequest:
 			dbprovisioner.ProcessDBProvisionerRequest(a.client, pkt)
+
+		case pbsystem.RunbookHookRequestType:
+			runbookhook.ProcessRequest(a.client, pkt)
 		}
 	}
 }
@@ -167,7 +171,7 @@ func (a *Agent) Run() error {
 func (a *Agent) processSessionOpen(pkt *pb.Packet) {
 	sessionID := pkt.Spec[pb.SpecGatewaySessionID]
 	sessionIDKey := string(sessionID)
-	log.Infof("session=%s - received connect request", sessionIDKey)
+	log.With("sid", sessionIDKey).Infof("received connect request")
 
 	connParams, err := a.buildConnectionParams(pkt)
 	if err != nil {
@@ -205,30 +209,6 @@ func (a *Agent) processSessionOpen(pkt *pb.Packet) {
 		}
 	}
 
-	if a.connStore.Get(gcpJSONCredentialsKey) == nil {
-		if gcpRawCred, ok := pkt.Spec[pb.SpecAgentGCPRawCredentialsKey]; ok {
-			a.connStore.Set(gcpJSONCredentialsKey, gcpRawCred)
-		}
-	}
-
-	if a.connStore.Get(dlpProviderKey) == nil {
-		if dlpProvider, ok := pkt.Spec[pb.SpecAgentDlpProvider]; ok {
-			a.connStore.Set(dlpProviderKey, dlpProvider)
-		}
-	}
-
-	if a.connStore.Get(msPresidioAnonymizerURLKey) == nil {
-		if anonymizerURL, ok := pkt.Spec[pb.SpecAgentMSPresidioAnonymizerURL]; ok {
-			a.connStore.Set(msPresidioAnonymizerURLKey, anonymizerURL)
-		}
-	}
-
-	if a.connStore.Get(msPresidioAnalyzerURLKey) == nil {
-		if analyzerURL, ok := pkt.Spec[pb.SpecAgentMSPresidioAnalyzerURL]; ok {
-			a.connStore.Set(msPresidioAnalyzerURLKey, analyzerURL)
-		}
-	}
-
 	go func() {
 		if err := a.checkTCPLiveness(pkt, connParams.EnvVars); err != nil {
 			_ = a.client.Send(&pb.Packet{
@@ -240,15 +220,19 @@ func (a *Agent) processSessionOpen(pkt *pb.Packet) {
 				},
 			})
 		}
+
+		requestCommand := connParams.CmdList
+		requestCommand = append(requestCommand, connParams.ClientArgs...)
 		a.connStore.Set(string(sessionID), connParams)
 		_ = a.client.Send(&pb.Packet{
 			Type: pbclient.SessionOpenOK,
 			Spec: map[string][]byte{
-				pb.SpecGatewaySessionID:  sessionID,
-				pb.SpecConnectionType:    pkt.Spec[pb.SpecConnectionType],
-				pb.SpecClientRequestPort: pkt.Spec[pb.SpecClientRequestPort],
+				pb.SpecGatewaySessionID:     sessionID,
+				pb.SpecConnectionType:       pkt.Spec[pb.SpecConnectionType],
+				pb.SpecClientRequestPort:    pkt.Spec[pb.SpecClientRequestPort],
+				pb.SpecClientExecCommandKey: []byte(strings.Join(requestCommand, " ")),
 			}})
-		log.Infof("session=%v - sent gateway connect ok", string(sessionID))
+		log.With("sid", sessionIDKey).Infof("sent gateway connect ok")
 	}()
 }
 
@@ -256,7 +240,7 @@ func (a *Agent) processTCPCloseConnection(pkt *pb.Packet) {
 	sessionID := pkt.Spec[pb.SpecGatewaySessionID]
 	clientConnID := pkt.Spec[pb.SpecClientConnectionID]
 	filterKey := fmt.Sprintf("%s:%s", string(sessionID), string(clientConnID))
-	log.Infof("closing tcp session, connid=%s, filter-by=%s", clientConnID, filterKey)
+	log.With("sid", sessionID).Infof("closing tcp session, connid=%s, filter-by=%s", clientConnID, filterKey)
 	filterFn := func(k string) bool { return strings.HasPrefix(k, filterKey) }
 	for key, obj := range a.connStore.Filter(filterFn) {
 		if client, _ := obj.(io.Closer); client != nil {
@@ -280,13 +264,13 @@ func (a *Agent) processSessionClose(pkt *pb.Packet) {
 }
 
 func (a *Agent) sessionCleanup(sessionID string) {
-	log.Infof("session=%s - cleaning up session", sessionID)
+	log.With("sid", sessionID).Infof("cleaning up session")
 	filterFn := func(k string) bool { return strings.Contains(k, sessionID) }
 	for key, obj := range a.connStore.Filter(filterFn) {
 		if v, ok := obj.(io.Closer); ok {
 			go func() {
 				if err := v.Close(); err != nil {
-					log.Printf("failed closing connection, err=%v", err)
+					log.With("sid", sessionID).Warnf("failed closing connection, err=%v", err)
 				}
 			}()
 			a.connStore.Del(key)
@@ -352,9 +336,6 @@ func (a *Agent) buildConnectionParams(pkt *pb.Packet) (*pb.AgentConnectionParams
 		connParams.EnvVars[key] = val
 	}
 
-	log.Infof("session=%s - connection params decoded with success, dlp-info-types=%d",
-		sessionIDKey, len(connParams.DLPInfoTypes))
-
 	connType := pb.ConnectionType(pkt.Spec[pb.SpecConnectionType])
 	for key, b64EncVal := range connParams.EnvVars {
 		if !strings.HasPrefix(key, "envvar:") {
@@ -400,7 +381,7 @@ func (a *Agent) checkTCPLiveness(pkt *pb.Packet, envVars map[string]any) error {
 		if err := isPortActive(connEnvVars); err != nil {
 			msg := fmt.Sprintf("failed connecting to remote host=%s, port=%s, reason=%v",
 				connEnvVars.host, connEnvVars.port, err)
-			log.Warnf("session=%v - %v", sessionID, msg)
+			log.With("sid", sessionID).Warn(msg)
 			return fmt.Errorf("%s", msg)
 		}
 	}
@@ -461,30 +442,6 @@ func (a *Agent) decodeConnectionParams(sessionID []byte, pkt *pb.Packet) *pb.Age
 		}
 	}
 	return &connParams
-}
-
-func (a *Agent) getGCPCredentials() string {
-	obj := a.connStore.Get(gcpJSONCredentialsKey)
-	v, _ := obj.([]byte)
-	return string(v)
-}
-
-func (a *Agent) getDlpProvider() string {
-	obj := a.connStore.Get(dlpProviderKey)
-	v, _ := obj.([]byte)
-	return string(v)
-}
-
-func (a *Agent) getMSPresidioAnalyzerURL() string {
-	obj := a.connStore.Get(msPresidioAnalyzerURLKey)
-	v, _ := obj.([]byte)
-	return string(v)
-}
-
-func (a *Agent) getMSPresidioAnonymizerURL() string {
-	obj := a.connStore.Get(msPresidioAnonymizerURLKey)
-	v, _ := obj.([]byte)
-	return string(v)
 }
 
 func b64Enc(src []byte) string { return base64.StdEncoding.EncodeToString(src) }

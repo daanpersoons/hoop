@@ -4,21 +4,19 @@ import (
 	"encoding/base64"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/hoophq/hoop/common/log"
 	pb "github.com/hoophq/hoop/common/proto"
 	pbagent "github.com/hoophq/hoop/common/proto/agent"
-	"github.com/hoophq/hoop/gateway/pgrest"
-	pgorgs "github.com/hoophq/hoop/gateway/pgrest/orgs"
-	pgplugins "github.com/hoophq/hoop/gateway/pgrest/plugins"
-	pgreview "github.com/hoophq/hoop/gateway/pgrest/review"
-	"github.com/hoophq/hoop/gateway/review"
-	"github.com/hoophq/hoop/gateway/security/idp"
+	reviewapi "github.com/hoophq/hoop/gateway/api/review"
+	"github.com/hoophq/hoop/gateway/appconfig"
+	"github.com/hoophq/hoop/gateway/models"
 	"github.com/hoophq/hoop/gateway/slack"
-	"github.com/hoophq/hoop/gateway/storagev2"
-	"github.com/hoophq/hoop/gateway/storagev2/types"
 	plugintypes "github.com/hoophq/hoop/gateway/transport/plugins/types"
 )
+
+var ErrMissingRequiredCredentials = fmt.Errorf("missing required credentials for slack plugin")
 
 const (
 	PluginConfigEnvVarsParam = "plugin_config"
@@ -27,8 +25,8 @@ const (
 
 type (
 	slackPlugin struct {
-		reviewSvc   *review.Service
-		idpProvider *idp.Provider
+		TransportReleaseConnection reviewapi.TransportReleaseConnectionFunc
+		apiURL                     string
 	}
 )
 
@@ -53,27 +51,25 @@ func addSlackServiceInstance(orgID string, slackSvc *slack.SlackService) {
 	instances[orgID] = slackSvc
 }
 
-func New(reviewSvc *review.Service, idpProvider *idp.Provider) *slackPlugin {
+func New(releaseConnFn reviewapi.TransportReleaseConnectionFunc) *slackPlugin {
 	instances = map[string]*slack.SlackService{}
 	mu = sync.RWMutex{}
 	return &slackPlugin{
-		reviewSvc:   reviewSvc,
-		idpProvider: idpProvider,
+		TransportReleaseConnection: releaseConnFn,
+		apiURL:                     appconfig.Get().ApiURL(),
 	}
 }
 
 func (p *slackPlugin) Name() string { return plugintypes.PluginSlackName }
 
 func (p *slackPlugin) startSlackServiceInstance(orgID string, slackConfig *slackConfig) error {
-	storectx := storagev2.NewOrganizationContext(orgID)
 	log.Infof("starting slack service instance for org %v", orgID)
 	ss, err := slack.New(
 		slackConfig.slackBotToken,
 		slackConfig.slackAppToken,
 		slackConfig.slackChannel,
 		orgID,
-		p.idpProvider.ApiURL,
-		&eventCallback{orgID, storectx, p.idpProvider},
+		p.apiURL,
 	)
 	if err != nil {
 		return fmt.Errorf("failed starting slack service, err=%v", err)
@@ -102,25 +98,25 @@ func (p *slackPlugin) startSlackServiceInstance(orgID string, slackConfig *slack
 }
 
 func (p *slackPlugin) OnStartup(_ plugintypes.Context) error {
-	orgList, err := pgorgs.New().FetchAllOrgs()
+	orgList, err := models.ListAllOrganizations()
 	if err != nil {
 		return fmt.Errorf("failed listing organizations: %v", err)
 	}
 
 	for _, org := range orgList {
-		pl, err := pgplugins.New().FetchOne(pgrest.NewOrgContext(org.ID), plugintypes.PluginSlackName)
-		if err != nil {
+		pl, err := models.GetPluginByName(org.ID, plugintypes.PluginSlackName)
+		if err != nil && err != models.ErrNotFound {
 			log.Errorf("failed retrieving plugin entity %v", err)
 			continue
 		}
-		if pl == nil || pl.Config == nil {
+		if pl == nil || len(pl.EnvVars) == 0 {
 			continue
 		}
 		if pl.OrgID == "" {
 			log.Errorf("inconsistent state (org) for plugin slack")
 			continue
 		}
-		slackConfig, err := parseSlackConfig(&types.PluginConfig{EnvVars: pl.Config.EnvVars})
+		slackConfig, err := parseSlackConfig(pl.EnvVars)
 		if err != nil {
 			log.Errorf("failed parsing slack config for org %v, err=%v", pl.OrgID, err)
 			continue
@@ -133,40 +129,59 @@ func (p *slackPlugin) OnStartup(_ plugintypes.Context) error {
 	return nil
 }
 
-func (p *slackPlugin) OnUpdate(oldState, newState *types.Plugin) error {
-	slackInstance := getSlackServiceInstance(newState.OrgID)
+func (p *slackPlugin) OnUpdate(oldState, newState plugintypes.PluginResource) error {
+	slackInstance := getSlackServiceInstance(newState.GetOrgID())
+	if slackInstance == nil {
+		slackInstance = &slack.SlackService{}
+	}
 	switch {
 	// when it creates the plugin for the first time
 	// it should only start it, if the client has sent a valid slack configuration
 	case oldState == nil:
-		if newSlackConfig, _ := parseSlackConfig(newState.Config); newSlackConfig != nil {
-			if slackInstance != nil {
-				slackInstance.Close()
-			}
-			return p.startSlackServiceInstance(newState.OrgID, newSlackConfig)
+		if newSlackConfig, _ := parseSlackConfig(newState.GetEnvVars()); newSlackConfig != nil {
+			slackInstance.Close()
+			return p.startSlackServiceInstance(newState.GetOrgID(), newSlackConfig)
 		}
 	// when previous configuration doesn't exists
-	case oldState.Config == nil:
-		newSlackConfig, err := parseSlackConfig(newState.Config)
+	case len(oldState.GetEnvVars()) == 0:
+		newSlackConfig, err := parseSlackConfig(newState.GetEnvVars())
 		if err != nil {
 			return err
 		}
-		return p.startSlackServiceInstance(newState.OrgID, newSlackConfig)
+		return p.startSlackServiceInstance(newState.GetOrgID(), newSlackConfig)
 	// when slack configuration changes
 	default:
-		if oldSlackConfig, _ := parseSlackConfig(oldState.Config); oldSlackConfig != nil {
-			newSlackConfig, err := parseSlackConfig(newState.Config)
-			if err != nil {
+		if oldSlackConfig, _ := parseSlackConfig(oldState.GetEnvVars()); oldSlackConfig != nil {
+			newSlackConfig, err := parseSlackConfig(newState.GetEnvVars())
+			switch err {
+			case ErrMissingRequiredCredentials:
+				if slackInstance != nil {
+					log.Warnf("configuration has changed to empty credentials, stopping slack instance %v", newState.GetOrgID())
+					slackInstance.Close()
+				}
+				return nil
+			case nil:
+			default:
 				return err
+
 			}
 			if oldSlackConfig.slackAppToken != newSlackConfig.slackAppToken ||
 				oldSlackConfig.slackBotToken != newSlackConfig.slackBotToken {
-				log.Warnf("configuration has changed, (re)starting slack instance %v", newState.OrgID)
+				log.Warnf("configuration has changed, (re)starting slack instance %v", newState.GetOrgID())
 				if slackInstance != nil {
 					slackInstance.Close()
 				}
-				removeSlackServiceInstance(newState.OrgID)
-				return p.startSlackServiceInstance(newState.OrgID, newSlackConfig)
+				removeSlackServiceInstance(newState.GetOrgID())
+				err := p.startSlackServiceInstance(newState.GetOrgID(), newSlackConfig)
+				if err == nil {
+					return nil
+				}
+				// rollback to previous configuration
+				log.Warnf("previous configuration failed to start, (re)starting old slack instance %v", oldState.GetOrgID())
+				if err := p.startSlackServiceInstance(oldState.GetOrgID(), oldSlackConfig); err != nil {
+					log.Warnf("failed to rollback the initialization of slack %v, reason=%v", oldState.GetOrgID(), err)
+				}
+				return err
 			}
 		}
 	}
@@ -203,21 +218,26 @@ func (p *slackPlugin) OnReceive(pctx plugintypes.Context, pkt *pb.Packet) (*plug
 		SlackChannels:  pctx.PluginConnectionConfig,
 	}
 
-	rev, err := pgreview.New().FetchOneBySid(pctx, pctx.SID)
-	if err != nil {
+	rev, err := models.GetReviewByIdOrSid(pctx.OrgID, pctx.SID)
+	if err != nil && err != models.ErrNotFound {
 		return nil, plugintypes.InternalErr("internal error, failed fetching review", err)
 	}
 	if rev != nil {
-		if rev.Status != types.ReviewStatusPending {
+		if rev.Status != models.ReviewStatusPending {
 			return nil, nil
 		}
-		sreq.ID = rev.Id
-		sreq.WebappURL = fmt.Sprintf("%s/reviews/%s", p.idpProvider.ApiURL, rev.Id)
-		sreq.ApprovalGroups = parseGroups(rev.ReviewGroupsData)
-		if rev.AccessDuration > 0 {
-			sreq.SessionTime = &rev.AccessDuration
+		reviewInput, err := rev.GetBlobInput()
+		if err != nil {
+			return nil, plugintypes.InternalErr("internal error, failed fetching review input", err)
 		}
-		sreq.Script = rev.Input
+		sreq.ID = rev.ID
+		sreq.WebappURL = fmt.Sprintf("%s/reviews/%s", p.apiURL, rev.ID)
+		sreq.ApprovalGroups = parseGroups(rev.ReviewGroups)
+		if rev.AccessDurationSec > 0 {
+			ad := time.Duration(rev.AccessDurationSec) * time.Second
+			sreq.SessionTime = &ad
+		}
+		sreq.Script = reviewInput
 	}
 
 	if sreq.WebappURL == "" || len(sreq.ApprovalGroups) == 0 || len(sreq.ApprovalGroups) >= slackMaxButtons {
@@ -240,13 +260,13 @@ type slackConfig struct {
 	slackChannel  string
 }
 
-func parseSlackConfig(pconf *types.PluginConfig) (*slackConfig, error) {
-	if pconf == nil {
-		return nil, fmt.Errorf("missing required credentials for slack plugin")
+func parseSlackConfig(envVars map[string]string) (*slackConfig, error) {
+	if len(envVars) == 0 {
+		return nil, ErrMissingRequiredCredentials
 	}
-	slackBotToken, _ := base64.StdEncoding.DecodeString(pconf.EnvVars["SLACK_BOT_TOKEN"])
-	slackAppToken, _ := base64.StdEncoding.DecodeString(pconf.EnvVars["SLACK_APP_TOKEN"])
-	slackChannel, _ := base64.StdEncoding.DecodeString(pconf.EnvVars["SLACK_CHANNEL"])
+	slackBotToken, _ := base64.StdEncoding.DecodeString(envVars["SLACK_BOT_TOKEN"])
+	slackAppToken, _ := base64.StdEncoding.DecodeString(envVars["SLACK_APP_TOKEN"])
+	slackChannel, _ := base64.StdEncoding.DecodeString(envVars["SLACK_CHANNEL"])
 	sc := slackConfig{
 		slackBotToken: string(slackBotToken),
 		slackAppToken: string(slackAppToken),
@@ -258,10 +278,10 @@ func parseSlackConfig(pconf *types.PluginConfig) (*slackConfig, error) {
 	return &sc, nil
 }
 
-func parseGroups(reviewGroups []types.ReviewGroup) []string {
+func parseGroups(reviewGroups []models.ReviewGroups) []string {
 	groups := make([]string, 0)
 	for _, g := range reviewGroups {
-		groups = append(groups, g.Group)
+		groups = append(groups, g.GroupName)
 	}
 	return groups
 }

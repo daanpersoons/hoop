@@ -3,6 +3,8 @@
 To start a development server it requires the following local tools:
 
 - [Golang 1.22+](https://go.dev/doc/install)
+- [Rust](https://www.rust-lang.org/tools/install)
+- [Rust-Cross](https://github.com/cross-rs/cross)
 - [Docker](https://docs.docker.com/engine/install/)
 - [Clojure / Java](https://clojure.org/guides/install_clojure)
 - [git](https://git-scm.com/book/en/v2/Getting-Started-Installing-Git)
@@ -29,6 +31,7 @@ cp .env.sample .env
 ```
 
 > The sample configuration file doesn't have a default identity provider. Make sure to configure one to be able to run this project.
+> By default this command will build the agentrs and will run inside the docker
 
 ```sh
 make run-dev
@@ -36,10 +39,10 @@ make run-dev
 
 #### Webapp Setup
 
-To build the webapp into the gateway
+To build the Webapp into the gateway
 
 ```sh
-WEBAPP_BUILD=1 make run-dev
+make build-dev-webapp
 ```
 
 ### Build Dev Client
@@ -53,6 +56,14 @@ make build-dev-client
 
 > Append `$HOME/.hoop/bin` to your `$PATH` in your profile to find commands when typing in your shell
 
+### Data Masking Setup
+
+We use Presidio as the provider to redact sensitive data on Hoop. To run the Presidio server, you need to have Docker installed and running.
+
+```sh
+make run-dev-presidio
+```
+
 ## Swagger / OpenAPI
 
 This project uses [swag](https://github.com/swaggo/swag) to generate the api documentation. Make sure to generate it every time a change is made in the API:
@@ -65,15 +76,6 @@ The gateway will expose the the openapi spec at `/api/openapiv2.json` and `/api/
 
 - https://swagger.io/tools/swagger-ui/
 - https://redocly.github.io/redoc/
-
-## Postgrest
-
-This project uses [postgrest](https://postgrest.org/en/stable/) as an interface to Postgres, it allows creating api's based on tables schema and permissions.
-The bootstrap process performs all the necessary setup to make the postgrest fully functional, it consists in three steps:
-
-- Perform the migration process using the [go-migrate library](https://github.com/golang-migrate/migrate)
-- Provisioning the roles and permissions required for postgrest to work properly. [See authentication.](https://postgrest.org/en/stable/references/auth.html)
-- Running the postgrest process in background
 
 ### Running Migrations
 
@@ -93,8 +95,28 @@ migrate create -ext sql -dir rootfs/app/migrations -seq my_new_change
 migrate -database 'postgres://hoopdevuser:1a2b3c4d@127.0.0.1:5449/hoopdevdb?sslmode=disable' -path rootfs/app/migrations/ down 1
 ```
 
-> In case of adding new views, make sure to add the proper permissions in the bootstrap process of postgrest
-
 ### Migration Best Practices
 
 - https://github.com/golang-migrate/migrate/blob/master/MIGRATIONS.md
+
+### How to create a new release
+
+1. After your pull request is merged into the main branch, update your local repository by pulling the latest changes:
+```sh
+git checkout main
+git pull origin main
+```
+
+2. Run the release command:
+```sh
+make publish
+```
+Note: This step requires the GitHub CLI (gh) installed and authenticated with your GitHub account.
+
+3. The release process automatically gathers all commits added since the last release and includes them in 
+the new release notes.
+
+4. Versioning rules `<version>.<minor>.<patch>`
+- VERION (X.0.0) – Increment when you make incompatible API changes.
+- MINOR (0.X.0) – Increment when you add functionality in a backward-compatible way.
+- PATCH (0.0.X) – Increment when you make backward-compatible bug fixes.

@@ -1,11 +1,11 @@
-FROM ubuntu:focal-20230605
+FROM ubuntu:noble-20250714
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ACCEPT_EULA=y
-ENV POSTGREST_VERSION 11.2.2
 
 RUN mkdir -p /app && \
     mkdir -p /opt/hoop/sessions && \
+    mkdir -p /opt/hoop/bin && \
     apt-get update -y && \
     apt-get install -y \
         xz-utils \
@@ -16,26 +16,11 @@ RUN mkdir -p /app && \
         gettext-base \
         curl
 
-RUN URL= && dpkgArch="$(dpkg --print-architecture)" \
-    && case "${dpkgArch##*-}" in \
-      amd64) URL="https://github.com/PostgREST/postgrest/releases/download/v$POSTGREST_VERSION/postgrest-v$POSTGREST_VERSION-linux-static-x64.tar.xz";; \
-      arm64) URL="https://github.com/PostgREST/postgrest/releases/download/v$POSTGREST_VERSION/postgrest-v$POSTGREST_VERSION-ubuntu-aarch64.tar.xz";; \
-      *) echo "unsupported architecture"; exit 1 ;; \
-    esac \
-    && curl -sL $URL -o postgrest.tar.xz && \
-    tar -xf postgrest.tar.xz && rm -f postgrest.tar.xz && \
-    mv postgrest /usr/local/bin/postgrest && \
-    chmod 0755 /usr/local/bin/postgrest && \
-    postgrest --version
-
-RUN mkdir -p /app && \
-    mkdir -p /opt/hoop/sessions
-
 RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && \
     locale-gen
-ENV LANG en_US.UTF-8
-ENV LANGUAGE en_US:en
-ENV LC_ALL en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+ENV LC_ALL=en_US.UTF-8
 
 COPY rootfs /
 COPY dist/binaries/ /tmp/
@@ -47,7 +32,9 @@ RUN tar -xf /tmp/hoop_*_$(uname -s)_$(uname -m).tar.gz -C /app/ && \
 
 EXPOSE 8009
 EXPOSE 8010
+EXPOSE 15432
 
 ENV PATH="/app:${PATH}"
+ENV PATH="${PATH}:/opt/hoop/bin"
 
 ENTRYPOINT ["tini", "--"]

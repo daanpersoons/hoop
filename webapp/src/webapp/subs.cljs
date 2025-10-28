@@ -1,7 +1,6 @@
 (ns webapp.subs
   (:require
-   [re-frame.core :as re-frame]
-   [webapp.formatters :as f]))
+   [re-frame.core :as re-frame]))
 
 (re-frame/reg-sub
  :user
@@ -201,14 +200,34 @@
    (:audit->session-details db)))
 
 (re-frame/reg-sub
- ::connections->updating-connection
+ :audit->session-logs
  (fn [db _]
-   (:connections->updating-connection db)))
+   (:audit->session-logs db)))
 
 (re-frame/reg-sub
  :connections->connection-connected
  (fn [db _]
    (:connections->connection-connected db)))
+
+(re-frame/reg-sub
+ :connections->test-connection
+ (fn [db _]
+   (:connections->test-connection db)))
+
+(re-frame/reg-sub
+ :connections->metadata
+ (fn [db _]
+   (get-in db [:connections :metadata :data])))
+
+(re-frame/reg-sub
+ :connections->metadata-loading?
+ (fn [db _]
+   (get-in db [:connections :metadata :loading] false)))
+
+(re-frame/reg-sub
+ :connections->metadata-error
+ (fn [db _]
+   (get-in db [:connections :metadata :error])))
 
 (re-frame/reg-sub
  :users->current-user
@@ -325,20 +344,11 @@
  (fn [db _]
    (:gateway->public-info db)))
 
+;; Active panel state
 (re-frame/reg-sub
- :editor-plugin->run-connection-list
+ :webclient->active-panel
  (fn [db _]
-   (:editor-plugin->run-connection-list db)))
-
-(re-frame/reg-sub
- :editor-plugin->run-connection-list-selected
- (fn [db _]
-   (:editor-plugin->run-connection-list-selected db)))
-
-(re-frame/reg-sub
- :editor-plugin->filtered-run-connection-list
- (fn [db _]
-   (:editor-plugin->filtered-run-connection-list db)))
+   (get db :webclient->active-panel nil)))
 
 (re-frame/reg-sub
  :editor-plugin->connections-exec-list
@@ -399,3 +409,14 @@
  :jira-integration->details
  (fn [db _]
    (:jira-integration->details db)))
+
+;; Command Palette subscriptions
+(re-frame/reg-sub
+ :command-palette
+ (fn [db _]
+   (:command-palette db)))
+
+(re-frame/reg-sub
+ :command-palette->search-results
+ (fn [db _]
+   (get-in db [:command-palette :search-results])))

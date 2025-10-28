@@ -40,15 +40,24 @@ cd libhoop && go mod tidy && cd ../
 
 WEBAPP_BUILD="${WEBAPP_BUILD:-0}"
 if [[ $WEBAPP_BUILD == "1" ]]; then
-  rm -rf ./dist/dev/resources
-  rm -f ./webapp/resources/public/js/app.origin.js
-  cd webapp && npm install && npm run release:hoop-ui && cd ../
-  cp -a webapp/resources/ ./dist/dev/resources
+  echo 'run "make build-dev-webapp" to build the webapp'
+  exit 1
 fi
 
 docker build -t hoopdev -f ./scripts/dev/Dockerfile .
 mkdir -p ./dist/dev/bin
 cp ./scripts/dev/entrypoint.sh ./dist/dev/bin/entrypoint.sh
+
+# Build Rust agent for development
+HOOP_RS_BUILD="${HOOP_RS_BUILD:-1}"
+if [[ $HOOP_RS_BUILD == "1" ]]; then
+  echo "Building Rust agent..."
+  echo ""
+  echo "You need to have Rust installed to build the Rust agent."
+  echo "You need to have Cross installed to build the Rust agent for multiple architectures."
+  make build-dev-rust
+fi
+
 
 VERSION="${VERSION:-unknown}"
 CGO_ENABLED=0 GOOS=linux go build \
@@ -61,8 +70,12 @@ docker run --rm --name hoopdev \
   -p 2225:22 \
   -p 8009:8009 \
   -p 8010:8010 \
+  -p 15432:15432 \
+  -p 12222:12222 \
+  -p 13389:13389 \
   --env-file=.env \
   --cap-add=NET_ADMIN \
+  --add-host=host.docker.internal:host-gateway \
   -v ./dist/dev/bin/:/app/bin/ \
   -v ./dist/dev/root/.ssh:/root/.ssh \
   -v ./rootfs/app/migrations/:/app/migrations/ \

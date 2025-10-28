@@ -19,21 +19,27 @@ import (
 	apiagents "github.com/hoophq/hoop/gateway/api/agents"
 	"github.com/hoophq/hoop/gateway/api/apiroutes"
 	apiconnections "github.com/hoophq/hoop/gateway/api/connections"
+	apidatamasking "github.com/hoophq/hoop/gateway/api/datamasking"
 	apifeatures "github.com/hoophq/hoop/gateway/api/features"
 	apiguardrails "github.com/hoophq/hoop/gateway/api/guardrails"
 	apihealthz "github.com/hoophq/hoop/gateway/api/healthz"
 	apijiraintegration "github.com/hoophq/hoop/gateway/api/integrations"
 	awsintegration "github.com/hoophq/hoop/gateway/api/integrations/aws"
-	localauthapi "github.com/hoophq/hoop/gateway/api/localauth"
-	loginapi "github.com/hoophq/hoop/gateway/api/login"
+	loginlocalapi "github.com/hoophq/hoop/gateway/api/login/local"
+	loginoidcapi "github.com/hoophq/hoop/gateway/api/login/oidc"
+	loginsamlapi "github.com/hoophq/hoop/gateway/api/login/saml"
 	"github.com/hoophq/hoop/gateway/api/openapi"
 	apiorgs "github.com/hoophq/hoop/gateway/api/orgs"
+	apipluginconnections "github.com/hoophq/hoop/gateway/api/pluginconnections"
 	apiplugins "github.com/hoophq/hoop/gateway/api/plugins"
 	apiproxymanager "github.com/hoophq/hoop/gateway/api/proxymanager"
 	apipublicserverinfo "github.com/hoophq/hoop/gateway/api/publicserverinfo"
 	apireports "github.com/hoophq/hoop/gateway/api/reports"
+	resourcesapi "github.com/hoophq/hoop/gateway/api/resources"
 	reviewapi "github.com/hoophq/hoop/gateway/api/review"
 	apirunbooks "github.com/hoophq/hoop/gateway/api/runbooks"
+	searchapi "github.com/hoophq/hoop/gateway/api/search"
+	apiserverconfig "github.com/hoophq/hoop/gateway/api/serverconfig"
 	apiserverinfo "github.com/hoophq/hoop/gateway/api/serverinfo"
 	serviceaccountapi "github.com/hoophq/hoop/gateway/api/serviceaccount"
 	sessionapi "github.com/hoophq/hoop/gateway/api/session"
@@ -41,18 +47,13 @@ import (
 	userapi "github.com/hoophq/hoop/gateway/api/user"
 	webhooksapi "github.com/hoophq/hoop/gateway/api/webhooks"
 	"github.com/hoophq/hoop/gateway/appconfig"
-	"github.com/hoophq/hoop/gateway/indexer"
-	"github.com/hoophq/hoop/gateway/review"
-	"github.com/hoophq/hoop/gateway/security/idp"
+	"github.com/hoophq/hoop/gateway/transport"
 )
 
 type Api struct {
-	IndexerHandler indexer.Handler
-	ReviewHandler  review.Handler
-	IDProvider     *idp.Provider
-	GrpcURL        string
-	TLSConfig      *tls.Config
-	logger         *zap.Logger
+	ReleaseConnectionFn reviewapi.TransportReleaseConnectionFunc
+	TLSConfig           *tls.Config
+	logger              *zap.Logger
 }
 
 //	@title			Hoop Api
@@ -69,9 +70,6 @@ type Api struct {
 //	@license.url	https://opensource.org/license/mit
 
 //	@tag.name	Authentication
-//	@tag.description.markdown
-
-//	@tag.name	Core
 //	@tag.description.markdown
 
 //	@tag.name	User Management
@@ -142,7 +140,7 @@ func (a *Api) StartAPI(sentryInit bool) {
 			Repanic: true,
 		}))
 	}
-	router := apiroutes.New(rg, a.IDProvider, appconfig.Get().GrpcURL(), appconfig.Get().ApiKey())
+	router := apiroutes.New(rg)
 	a.buildRoutes(router)
 	openapi.RegisterGinValidators()
 
@@ -163,8 +161,9 @@ func (a *Api) StartAPI(sentryInit bool) {
 }
 
 func (api *Api) buildRoutes(r *apiroutes.Router) {
-	reviewHandler := reviewapi.NewHandler(&api.ReviewHandler)
-	loginHandler := loginapi.New(api.IDProvider)
+	reviewHandler := reviewapi.NewHandler(api.ReleaseConnectionFn)
+	loginOidcApiHandler := loginoidcapi.New()
+	loginSamlApiHandler := loginsamlapi.New()
 
 	r.GET("/healthz", apihealthz.LivenessHandler())
 	r.GET("/openapiv2.json", openapi.Handler)
@@ -174,17 +173,22 @@ func (api *Api) buildRoutes(r *apiroutes.Router) {
 	r.GET("/serverinfo",
 		apiroutes.ReadOnlyAccessRole,
 		r.AuthMiddleware,
-		apiserverinfo.New(api.GrpcURL).Get)
+		apiserverinfo.Get)
 
-	r.GET("/login", loginHandler.Login)
-	r.GET("/callback", loginHandler.LoginCallback)
+	// Ouath2 / OIDC
+	r.GET("/login", loginOidcApiHandler.Login)
+	r.GET("/callback", loginOidcApiHandler.LoginCallback)
+
+	// SAML 2.0
+	r.GET("/saml/login", loginSamlApiHandler.SamlLogin)
+	r.POST("/saml/callback", loginSamlApiHandler.SamlLoginCallback)
 
 	r.POST("/localauth/register",
 		api.TrackRequest(analytics.EventSignup),
-		localauthapi.Register)
+		loginlocalapi.Register)
 	r.POST("/localauth/login",
 		api.TrackRequest(analytics.EventLogin),
-		localauthapi.Login)
+		loginlocalapi.Login)
 
 	r.POST("/signup",
 		api.TrackRequest(analytics.EventSignup),
@@ -196,34 +200,42 @@ func (api *Api) buildRoutes(r *apiroutes.Router) {
 		r.AuthMiddleware,
 		userapi.GetUserInfo)
 	r.GET("/users",
-		apiroutes.AdminOnlyAccessRole,
 		r.AuthMiddleware,
 		userapi.List)
 	r.GET("/users/:emailOrID",
 		apiroutes.ReadOnlyAccessRole,
 		r.AuthMiddleware,
 		userapi.GetUserByEmailOrID)
-	r.PATCH("/users/self/slack",
-		r.AuthMiddleware,
-		api.TrackRequest(analytics.EventUpdateUser),
-		userapi.PatchSlackID)
-	r.GET("/users/groups",
-		apiroutes.ReadOnlyAccessRole,
-		r.AuthMiddleware,
-		userapi.ListAllGroups)
 	r.POST("/users",
 		apiroutes.AdminOnlyAccessRole,
 		r.AuthMiddleware,
 		userapi.Create)
-	r.DELETE("/users/:id",
-		apiroutes.AdminOnlyAccessRole,
-		r.AuthMiddleware,
-		userapi.Delete)
 	r.PUT("/users/:id",
 		apiroutes.AdminOnlyAccessRole,
 		r.AuthMiddleware,
 		api.TrackRequest(analytics.EventUpdateUser),
 		userapi.Update)
+	r.PATCH("/users/self/slack",
+		r.AuthMiddleware,
+		api.TrackRequest(analytics.EventUpdateUser),
+		userapi.PatchSlackID)
+	r.DELETE("/users/:id",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		userapi.Delete)
+
+	r.GET("/users/groups",
+		apiroutes.ReadOnlyAccessRole,
+		r.AuthMiddleware,
+		userapi.ListAllGroups)
+	r.POST("/users/groups",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		userapi.CreateGroup)
+	r.DELETE("/users/groups/:name",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		userapi.DeleteGroup)
 
 	r.GET("/serviceaccounts",
 		apiroutes.ReadOnlyAccessRole,
@@ -250,12 +262,6 @@ func (api *Api) buildRoutes(r *apiroutes.Router) {
 		r.AuthMiddleware,
 		api.TrackRequest(analytics.EventUpdateConnection),
 		apiconnections.Put)
-	// DEPRECATED in flavor of POST /sessions
-	r.POST("/connections/:name/exec",
-		r.AuthMiddleware,
-		api.TrackRequest(analytics.EventApiExecConnection),
-		sessionapi.Post,
-	)
 	r.GET("/connections",
 		r.AuthMiddleware,
 		apiconnections.List)
@@ -271,29 +277,29 @@ func (api *Api) buildRoutes(r *apiroutes.Router) {
 		apiroutes.ReadOnlyAccessRole,
 		r.AuthMiddleware,
 		apiconnections.ListDatabases)
-	r.GET("/connections/:nameOrID/schemas",
+	r.GET("/connections/:nameOrID/tables",
 		apiroutes.ReadOnlyAccessRole,
 		r.AuthMiddleware,
-		apiconnections.GetDatabaseSchemas)
-
-	// TODO(san): needs more testing, will add these endpoints later on
-	// r.POST("/connection-tags",
-	// 	r.AuthMiddleware,
-	// 	// api.TrackRequest(analytics.EventApiExecConnection),
-	// 	apiconnections.CreateTag,
-	// )
-	// r.PUT("/connection-tags/:id",
-	// 	r.AuthMiddleware,
-	// 	// api.TrackRequest(analytics.EventApiExecConnection),
-	// 	apiconnections.UpdateTagByID,
-	// )
-	// r.GET("/connection-tags/:id",
-	// 	r.AuthMiddleware,
-	// 	// api.TrackRequest(analytics.EventApiExecConnection),
-	// 	apiconnections.GetTagByID,
-	// )
-	r.GET("/connection-tags",
+		apiconnections.ListTables)
+	r.GET("/connections/:nameOrID/columns",
+		apiroutes.ReadOnlyAccessRole,
+		r.AuthMiddleware,
+		apiconnections.GetTableColumns)
+	r.PUT("/connections/:nameOrID/datamasking-rules",
 		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		apiconnections.UpdateDataMaskingRuleConnection)
+
+	r.GET("/connections/:nameOrID/test",
+		r.AuthMiddleware,
+		apiconnections.TestConnection)
+	r.POST("/connections/:nameOrID/credentials",
+		r.AuthMiddleware,
+		apiconnections.CreateConnectionCredentials,
+	)
+
+	r.GET("/connection-tags",
+		apiroutes.ReadOnlyAccessRole,
 		r.AuthMiddleware,
 		apiconnections.ListTags,
 	)
@@ -313,15 +319,18 @@ func (api *Api) buildRoutes(r *apiroutes.Router) {
 	r.GET("/reviews",
 		r.AuthMiddleware,
 		api.TrackRequest(analytics.EventFetchReviews),
-		reviewHandler.List)
+		reviewHandler.List,
+	)
 	r.GET("/reviews/:id",
 		r.AuthMiddleware,
 		api.TrackRequest(analytics.EventFetchReviews),
-		reviewHandler.Get)
+		reviewHandler.GetByIdOrSid,
+	)
 	r.PUT("/reviews/:id",
 		r.AuthMiddleware,
 		api.TrackRequest(analytics.EventUpdateReview),
-		reviewHandler.Put)
+		reviewHandler.ReviewByIdOrSid,
+	)
 
 	r.POST("/agents",
 		apiroutes.AdminOnlyAccessRole,
@@ -395,6 +404,21 @@ func (api *Api) buildRoutes(r *apiroutes.Router) {
 		r.AuthMiddleware,
 		apiplugins.Get)
 
+	// the resource conn is used to avoid conflict with /plugins/runbooks/connections route
+
+	r.PUT("/plugins/:name/conn/:id",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		apipluginconnections.UpsertPluginConnection)
+	r.GET("/plugins/:name/conn/:id",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		apipluginconnections.GetPluginConnection)
+	r.DELETE("/plugins/:name/conn/:id",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		apipluginconnections.DeletePluginConnection)
+
 	// alias routes
 	r.GET("/plugins/audit/sessions/:session_id",
 		apiroutes.ReadOnlyAccessRole,
@@ -415,7 +439,8 @@ func (api *Api) buildRoutes(r *apiroutes.Router) {
 		sessionapi.Kill)
 	r.PUT("/sessions/:session_id/review",
 		r.AuthMiddleware,
-		reviewHandler.ReviewBySession)
+		reviewHandler.ReviewBySid,
+	)
 	r.PATCH("/sessions/:session_id/metadata",
 		r.AuthMiddleware,
 		sessionapi.PatchMetadata)
@@ -437,12 +462,6 @@ func (api *Api) buildRoutes(r *apiroutes.Router) {
 		r.AuthMiddleware,
 		apireports.SessionReport)
 
-	r.POST("/plugins/indexer/sessions/search",
-		r.AuthMiddleware,
-		api.TrackRequest(analytics.EventSearch),
-		api.IndexerHandler.Search,
-	)
-
 	r.GET("/plugins/runbooks/connections/:name/templates",
 		apiroutes.ReadOnlyAccessRole,
 		r.AuthMiddleware,
@@ -461,7 +480,78 @@ func (api *Api) buildRoutes(r *apiroutes.Router) {
 		apiroutes.AdminOnlyAccessRole,
 		r.AuthMiddleware,
 		api.TrackRequest(analytics.EventOpenWebhooksDashboard),
-		webhooksapi.Get)
+		webhooksapi.GetDashboardURL)
+
+	// svix experimental routes (endpoints)
+	r.GET("/webhooks/endpoints",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		webhooksapi.ListSvixEndpoints,
+	)
+	r.GET("/webhooks/endpoints/:id",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		webhooksapi.GetSvixEndpointByID,
+	)
+	r.POST("/webhooks/endpoints",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		webhooksapi.CreateSvixEndpoint,
+	)
+	r.PUT("/webhooks/endpoints/:id",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		webhooksapi.UpdateSvixEndpoint,
+	)
+	r.DELETE("/webhooks/endpoints/:id",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		webhooksapi.DeleteSvixEndpointByID,
+	)
+
+	// svix experimental routes (event types)
+	r.POST("/webhooks/eventtypes",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		webhooksapi.CreateSvixEventType,
+	)
+	r.PUT("/webhooks/eventtypes/:name",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		webhooksapi.UpdateSvixEventType,
+	)
+	r.GET("/webhooks/eventtypes",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		webhooksapi.ListSvixEventTypes,
+	)
+	r.GET("/webhooks/eventtypes/:name",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		webhooksapi.GetSvixEventTypeByName,
+	)
+	r.DELETE("/webhooks/eventtypes/:name",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		webhooksapi.DeleteSvixEventType,
+	)
+
+	// svix experimental routes (messages)
+	r.POST("/webhooks/messages",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		webhooksapi.CreateSvixMessage,
+	)
+	r.GET("/webhooks/messages",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		webhooksapi.ListSvixMessages,
+	)
+	r.GET("/webhooks/messages/:id",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		webhooksapi.GetSvixMessageByID,
+	)
 
 	// Jira Integration routes
 	r.GET("/integrations/jira",
@@ -497,15 +587,15 @@ func (api *Api) buildRoutes(r *apiroutes.Router) {
 		r.AuthMiddleware,
 		apijiraintegration.GetIssueTemplatesByID,
 	)
-	r.GET("/integrations/jira/issuetemplates/:id/objecttype-values",
-		r.AuthMiddleware,
-		apijiraintegration.GetIssueTemplateObjectTypeValues)
-
 	r.DELETE("/integrations/jira/issuetemplates/:id",
 		apiroutes.AdminOnlyAccessRole,
 		r.AuthMiddleware,
 		apijiraintegration.DeleteIssueTemplates,
 	)
+
+	r.GET("/integrations/jira/assets/objects",
+		r.AuthMiddleware,
+		apijiraintegration.GetAssetObjects)
 
 	// AWS routes
 	r.GET("/integrations/aws/iam/userinfo",
@@ -529,15 +619,15 @@ func (api *Api) buildRoutes(r *apiroutes.Router) {
 		// api.TrackRequest,
 		awsintegration.ListOrganizations)
 
-	r.POST("/integrations/aws/iam/verify",
-		apiroutes.AdminOnlyAccessRole,
-		r.AuthMiddleware,
-		awsintegration.IAMVerifyPermissions)
-
 	r.POST("/integrations/aws/rds/describe-db-instances",
 		apiroutes.AdminOnlyAccessRole,
 		r.AuthMiddleware,
 		awsintegration.DescribeRDSDBInstances)
+
+	r.POST("/integrations/aws/rds/credentials",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		awsintegration.CreateRDSRootPassword)
 
 	r.POST("/dbroles/jobs",
 		apiroutes.AdminOnlyAccessRole,
@@ -580,4 +670,78 @@ func (api *Api) buildRoutes(r *apiroutes.Router) {
 		r.AuthMiddleware,
 		api.TrackRequest(analytics.EventDeleteGuardRailRules),
 		apiguardrails.Delete)
+
+	r.POST("/datamasking-rules",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		apidatamasking.Post)
+	r.PUT("/datamasking-rules/:id",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		apidatamasking.Put)
+	r.GET("/datamasking-rules",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		apidatamasking.List)
+	r.GET("/datamasking-rules/:id",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		apidatamasking.Get)
+	r.DELETE("/datamasking-rules/:id",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		apidatamasking.Delete)
+
+	// server config routes
+	r.GET("/serverconfig/misc",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		apiserverconfig.GetServerMisc,
+	)
+	r.PUT("/serverconfig/misc",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		apiserverconfig.UpdateServerMisc,
+	)
+	r.GET("/serverconfig/auth",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		apiserverconfig.GetAuthConfig,
+	)
+	r.PUT("/serverconfig/auth",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		apiserverconfig.UpdateAuthConfig,
+	)
+	r.POST("/serverconfig/auth/apikey",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		apiserverconfig.GenerateApiKey,
+	)
+
+	r.GET("/search",
+		r.AuthMiddleware,
+		searchapi.Get,
+	)
+
+	r.GET("/ws", transport.HandleConnection)
+
+	r.GET("/resources",
+		r.AuthMiddleware,
+		resourcesapi.ListResources)
+	r.GET("/resources/:name",
+		r.AuthMiddleware,
+		resourcesapi.GetResource)
+	r.POST("/resources",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		resourcesapi.CreateResource)
+	r.PUT("/resources/:name",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		resourcesapi.UpdateResource)
+	r.DELETE("/resources/:name",
+		apiroutes.AdminOnlyAccessRole,
+		r.AuthMiddleware,
+		resourcesapi.DeleteResource)
 }

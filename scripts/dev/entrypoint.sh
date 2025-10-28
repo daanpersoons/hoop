@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -eo pipefail
+
 cd /app/
 
 echo "--> STARTING GATEWAY ..."
@@ -17,11 +19,32 @@ if [ "$ORG_MULTI_TENANT" == "true" ]; then
   exit $?
 fi
 
+# add ec2 metadata mock server
+# https://github.com/aws/amazon-ec2-metadata-mock
+if [ -n "$AWS_SESSION_TOKEN_JSON" ]; then
+  echo "--> ADDING EC2 METADATA MOCK SERVER ..."
+  ip addr add 169.254.169.254/32 dev eth0
+
+  echo -e "$AWS_SESSION_TOKEN_JSON" | sed 's|SessionToken|Token|g' | jq '{
+  "metadata": {
+    "values": {
+      "iam-security-credentials": .Credentials
+    }
+  }
+}' > /tmp/metadata-mock-config.json
+  ec2-metadata-mock --hostname 169.254.169.254 --port 80 -c /tmp/metadata-mock-config.json &
+fi
+
+
 psql $POSTGRES_DB_URI <<EOT
-INSERT INTO agents (org_id, id, name, mode, key_hash, status)
+INSERT INTO private.agents (org_id, id, name, mode, key_hash, status)
     VALUES ((SELECT id from private.orgs), '75122BCE-F957-49EB-A812-2AB60977CD9F', 'default', 'standard', '7854115b1ae448fec54d8bf50d3ce223e30c1c933edcd12767692574f326df57', 'DISCONNECTED')
     ON CONFLICT DO NOTHING;
 EOT
+
+export RUST_LOG=debug
+# inside the docker container the hoop_rs binary is located in /app/bin/hoop_rs
+export PATH="/app/bin:$PATH"
 
 echo "--> STARTING AGENT ..."
 # get digest of the agent secret key

@@ -1,11 +1,11 @@
 package transport
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
 
-	"github.com/getsentry/sentry-go"
 	"github.com/hoophq/hoop/common/apiutils"
 	"github.com/hoophq/hoop/common/grpc"
 	"github.com/hoophq/hoop/common/log"
@@ -14,8 +14,9 @@ import (
 	pbclient "github.com/hoophq/hoop/common/proto/client"
 	pbgateway "github.com/hoophq/hoop/common/proto/gateway"
 	"github.com/hoophq/hoop/gateway/analytics"
-	"github.com/hoophq/hoop/gateway/appconfig"
-	"github.com/hoophq/hoop/gateway/storagev2/types"
+	"github.com/hoophq/hoop/gateway/api/openapi"
+	"github.com/hoophq/hoop/gateway/guardrails"
+	"github.com/hoophq/hoop/gateway/models"
 	"github.com/hoophq/hoop/gateway/transport/connectionrequests"
 	transportext "github.com/hoophq/hoop/gateway/transport/extensions"
 	pluginslack "github.com/hoophq/hoop/gateway/transport/plugins/slack"
@@ -93,14 +94,14 @@ func (s *Server) subscribeClient(stream *streamclient.ProxyStream) (err error) {
 	userAgent := apiutils.NormalizeUserAgent(func(key string) []string {
 		return []string{stream.GetMeta("user-agent")}
 	})
-	analytics.New().Track(pctx.UserEmail, eventName, map[string]any{
+	analytics.New().Track(pctx.UserID, eventName, map[string]any{
+		"org-id":                pctx.OrgID,
 		"connection-name":       pctx.ConnectionName,
 		"connection-type":       pctx.ConnectionType,
 		"connection-subtype":    pctx.ConnectionSubType,
 		"connection-entrypoint": cmdEntrypoint,
 		"client-version":        stream.GetMeta("version"),
 		"platform":              stream.GetMeta("platform"),
-		"hostname":              stream.GetMeta("hostname"),
 		"user-agent":            userAgent,
 		"origin":                clientOrigin,
 		"verb":                  clientVerb,
@@ -115,7 +116,7 @@ func (s *Server) subscribeClient(stream *streamclient.ProxyStream) (err error) {
 
 func (s *Server) listenClientMessages(stream *streamclient.ProxyStream) error {
 	pctx := stream.PluginContext()
-	recvCh := grpc.NewStreamRecv(stream)
+	recvCh := grpc.NewStreamRecv(stream.Context(), stream)
 	for {
 		var dstream *grpc.DataStream
 		select {
@@ -154,13 +155,19 @@ func (s *Server) listenClientMessages(stream *streamclient.ProxyStream) error {
 		case *plugintypes.InternalError:
 			if v.HasInternalErr() {
 				log.With("sid", pctx.SID).Errorf("plugin rejected packet, %v", v.FullErr())
-				sentry.CaptureException(fmt.Errorf(v.FullErr()))
 			}
 			return status.Errorf(codes.Internal, err.Error())
 		case nil: // noop
 		default:
 			return status.Errorf(codes.Internal, err.Error())
 		}
+
+		// this function must deperecate the plugin system above
+		if err := handleExtensionOnReceive(pctx, pkt); err != nil {
+			log.With("sid", pctx.SID).Warn(err)
+			return err
+		}
+
 		if connectResponse != nil {
 			if connectResponse.Context != nil {
 				pctx.Context = connectResponse.Context
@@ -180,20 +187,25 @@ func (s *Server) listenClientMessages(stream *streamclient.ProxyStream) error {
 	}
 }
 
-func (s *Server) processClientPacket(stream *streamclient.ProxyStream, pkt *pb.Packet, pctx plugintypes.Context) error {
+func handleExtensionOnReceive(pctx plugintypes.Context, pkt *pb.Packet) error {
 	extContext := transportext.Context{
 		OrgID:                               pctx.OrgID,
 		SID:                                 pctx.SID,
+		AgentID:                             pctx.AgentID,
 		ConnectionName:                      pctx.ConnectionName,
+		ConnectionType:                      pctx.ConnectionType,
+		ConnectionSubType:                   pctx.ConnectionSubType,
+		ConnectionEnvs:                      pctx.ConnectionSecret,
 		ConnectionJiraTransitionNameOnClose: pctx.ConnectionJiraTransitionNameOnClose,
+		ConnectionReviewers:                 pctx.ConnectionReviewers,
+		UserEmail:                           pctx.UserEmail,
 		Verb:                                pctx.ClientVerb,
 	}
 
-	if err := transportext.OnReceive(extContext, pkt); err != nil {
-		log.With("sid", pctx.SID).Error(err)
-		return err
-	}
+	return transportext.OnReceive(extContext, pkt)
+}
 
+func (s *Server) processClientPacket(stream *streamclient.ProxyStream, pkt *pb.Packet, pctx plugintypes.Context) error {
 	switch pb.PacketType(pkt.Type) {
 	case pbagent.SessionOpen:
 		spec := map[string][]byte{
@@ -201,19 +213,22 @@ func (s *Server) processClientPacket(stream *streamclient.ProxyStream, pkt *pb.P
 			pb.SpecConnectionType:   pb.ToConnectionType(pctx.ConnectionType, pctx.ConnectionSubType).Bytes(),
 		}
 
-		if jsonCred := appconfig.Get().GcpDLPJsonCredentials(); jsonCred != "" {
+		// The injection of these credentials via spec item are DEPRECATED in flavor of
+		// propagating these values in the AgentConnectionParams
+		// It should be kept for compatibility with older agents (< 1.35.11)
+		if jsonCred := s.AppConfig.GcpDLPJsonCredentials(); jsonCred != "" {
 			spec[pb.SpecAgentGCPRawCredentialsKey] = []byte(jsonCred)
 		}
 
-		if dlpProvider := appconfig.Get().DlpProvider(); dlpProvider != "" {
+		if dlpProvider := s.AppConfig.DlpProvider(); dlpProvider != "" {
 			spec[pb.SpecAgentDlpProvider] = []byte(dlpProvider)
 		}
 
-		if msPresidioAnalyzerURL := appconfig.Get().MSPresidioAnalyzerURL(); msPresidioAnalyzerURL != "" {
+		if msPresidioAnalyzerURL := s.AppConfig.MSPresidioAnalyzerURL(); msPresidioAnalyzerURL != "" {
 			spec[pb.SpecAgentMSPresidioAnalyzerURL] = []byte(msPresidioAnalyzerURL)
 		}
 
-		if msPresidioAnonymizerURL := appconfig.Get().MSPresidioAnomymizerURL(); msPresidioAnonymizerURL != "" {
+		if msPresidioAnonymizerURL := s.AppConfig.MSPresidioAnomymizerURL(); msPresidioAnonymizerURL != "" {
 			spec[pb.SpecAgentMSPresidioAnonymizerURL] = []byte(msPresidioAnonymizerURL)
 		}
 
@@ -225,18 +240,102 @@ func (s *Server) processClientPacket(stream *streamclient.ProxyStream, pkt *pb.P
 			})
 			return pb.ErrAgentOffline
 		}
+
+		var entityTypesJsonData json.RawMessage
+		if s.AppConfig.DlpProvider() == "mspresidio" {
+			var err error
+			entityTypesJsonData, err = models.GetDataMaskingEntityTypes(pctx.OrgID, pctx.ConnectionID)
+			if err != nil {
+				log.With("sid", pctx.SID, "connection-id", pctx.ConnectionID).Errorf("failed getting data masking entity types, err=%v", err)
+				return status.Errorf(codes.Internal, "failed obtaining data masking entity types, err=%v", err)
+			}
+		}
+
+		// override the entrypoint of the connection command
+		if pctx.ClientVerb == pb.ClientVerbPlainExec {
+			connectionCommandJSON, ok := pkt.Spec[pb.SpecConnectionCommand]
+			if ok {
+				var connectionCommand []string
+				if err := json.Unmarshal(connectionCommandJSON, &connectionCommand); err != nil {
+					log.With("sid", pctx.SID).Errorf("failed decoding connection command override, err=%v", err)
+					return status.Errorf(codes.Internal, "failed decoding connection command override, err=%v", err)
+				}
+				pctx.ConnectionCommand = connectionCommand
+			}
+		}
+
+		infoTypes := stream.GetRedactInfoTypes()
+		if pctx.ClientVerb == pb.ClientVerbPlainExec {
+			infoTypes = nil // do not redact info types for plain exec
+			entityTypesJsonData = nil
+		}
+
+		var guardRailRulesJsonData json.RawMessage
+		if pctx.ClientVerb != pb.ClientVerbPlainExec {
+			connGuardRailRules, err := models.GetConnectionGuardRailRules(pctx.OrgID, pctx.ConnectionName)
+			if err != nil {
+				log.With("sid", pctx.SID, "connection", pctx.ConnectionName).Errorf("failed getting guard rail rules, err=%v", err)
+				return status.Errorf(codes.Internal, "failed obtaining guard rail rules, err=%v", err)
+			}
+
+			if connGuardRailRules != nil {
+				// Parse input rules
+				var inputRules []guardrails.DataRules
+				if connGuardRailRules.GuardRailInputRules != nil {
+					inputRules, err = guardrails.Decode(connGuardRailRules.GuardRailInputRules)
+					if err != nil {
+						log.With("sid", pctx.SID, "connection", pctx.ConnectionName).Errorf("failed decoding guard rail input rules, err=%v", err)
+						return status.Errorf(codes.Internal, "failed decoding guard rail input rules, err=%v", err)
+					}
+				}
+
+				// Parse output rules
+				var outputRules []guardrails.DataRules
+				if connGuardRailRules.GuardRailOutputRules != nil {
+					outputRules, err = guardrails.Decode(connGuardRailRules.GuardRailOutputRules)
+					if err != nil {
+						log.With("sid", pctx.SID, "connection", pctx.ConnectionName).Errorf("failed decoding guard rail output rules, err=%v", err)
+						return status.Errorf(codes.Internal, "failed decoding guard rail output rules, err=%v", err)
+					}
+				}
+
+				if inputRules != nil || outputRules != nil {
+					// Marshal both rules into a single json object
+					guardRailRulesJsonData, err = json.Marshal(struct {
+						InputRules  []guardrails.DataRules `json:"input_rules"`
+						OutputRules []guardrails.DataRules `json:"output_rules"`
+					}{
+						InputRules:  inputRules,
+						OutputRules: outputRules,
+					})
+
+					if err != nil {
+						log.With("sid", pctx.SID, "connection", pctx.ConnectionName).Errorf("failed marshaling guard rail rules, err=%v", err)
+						return status.Errorf(codes.Internal, "failed marshaling guard rail rules, err=%v", err)
+					}
+				}
+			}
+		}
+
 		clientArgs := clientArgsDecode(pkt.Spec)
 		connParams, err := pb.GobEncode(&pb.AgentConnectionParams{
-			ConnectionName: pctx.ConnectionName,
-			ConnectionType: pb.ToConnectionType(pctx.ConnectionType, pctx.ConnectionSubType).String(),
-			UserID:         pctx.UserID,
-			UserEmail:      pctx.UserEmail,
-			EnvVars:        pctx.ConnectionSecret,
-			CmdList:        pctx.ConnectionCommand,
-			ClientArgs:     clientArgs,
-			ClientVerb:     pctx.ClientVerb,
-			ClientOrigin:   pctx.ClientOrigin,
-			DLPInfoTypes:   stream.GetRedactInfoTypes(),
+			ConnectionName:             pctx.ConnectionName,
+			ConnectionType:             pb.ToConnectionType(pctx.ConnectionType, pctx.ConnectionSubType).String(),
+			UserID:                     pctx.UserID,
+			UserEmail:                  pctx.UserEmail,
+			EnvVars:                    pctx.ConnectionSecret,
+			CmdList:                    pctx.ConnectionCommand,
+			ClientArgs:                 clientArgs,
+			ClientVerb:                 pctx.ClientVerb,
+			ClientOrigin:               pctx.ClientOrigin,
+			DlpProvider:                s.AppConfig.DlpProvider(),
+			DlpMode:                    s.AppConfig.DlpMode(),
+			DlpGcpRawCredentialsJSON:   s.AppConfig.GcpDLPJsonCredentials(),
+			DlpPresidioAnalyzerURL:     s.AppConfig.MSPresidioAnalyzerURL(),
+			DlpPresidioAnonymizerURL:   s.AppConfig.MSPresidioAnomymizerURL(),
+			DLPInfoTypes:               infoTypes,
+			DataMaskingEntityTypesData: entityTypesJsonData,
+			GuardRailRules:             guardRailRulesJsonData,
 		})
 		if err != nil {
 			return fmt.Errorf("failed encoding connection params err=%v", err)
@@ -279,21 +378,21 @@ func handleSystemPacketRequests(pktType string) (handled bool) {
 	return
 }
 
-func (s *Server) ReviewStatusChange(rev *types.Review) {
-	if rev.Status == types.ReviewStatusApproved {
+func (s *Server) ReleaseConnectionOnReview(orgID, sid, reviewOwnerSlackID, reviewStatus string) {
+	if reviewStatus == string(openapi.ReviewStatusApproved) {
 		pluginslack.SendApprovedMessage(
-			rev.OrgId,
-			rev.ReviewOwner.SlackID,
-			rev.Session,
-			s.IDProvider.ApiURL,
+			orgID,
+			reviewOwnerSlackID,
+			sid,
+			s.AppConfig.ApiURL(),
 		)
 	}
 
-	proxyStream := streamclient.GetProxyStream(rev.Session)
+	proxyStream := streamclient.GetProxyStream(sid)
 	if proxyStream != nil {
-		payload := []byte(rev.Input)
+		var payload []byte
 		packetType := pbclient.SessionOpenApproveOK
-		if rev.Status == types.ReviewStatusRejected {
+		if reviewStatus == string(openapi.ReviewStatusRejected) {
 			packetType = pbclient.SessionClose
 			payload = []byte(`access to connection has been denied`)
 			proxyStream.Close(fmt.Errorf("access to connection has been denied"))
@@ -301,12 +400,11 @@ func (s *Server) ReviewStatusChange(rev *types.Review) {
 		// TODO: return erroo to caller
 		_ = proxyStream.Send(&pb.Packet{
 			Type:    packetType,
-			Spec:    map[string][]byte{pb.SpecGatewaySessionID: []byte(rev.Session)},
+			Spec:    map[string][]byte{pb.SpecGatewaySessionID: []byte(sid)},
 			Payload: payload,
 		})
 	}
-	log.With("sid", rev.Session, "connection", rev.Connection.Name, "has-stream", proxyStream != nil).
-		Infof("review status change")
+	log.With("sid", sid, "has-stream", proxyStream != nil).Infof("review status change")
 }
 
 func validateConnectionType(clientVerb string, pctx plugintypes.Context) error {

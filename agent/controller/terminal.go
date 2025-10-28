@@ -36,9 +36,20 @@ func (a *Agent) doTerminalWriteAgentStdin(pkt *pb.Packet) {
 
 	spec := map[string][]byte{pb.SpecGatewaySessionID: []byte(sid)}
 	stdoutWriter := pb.NewStreamWriter(a.client, pbclient.WriteStdout, spec)
+
+	var dataMaskingEntityTypesData string
+	if connParams.DataMaskingEntityTypesData != nil {
+		dataMaskingEntityTypesData = string(connParams.DataMaskingEntityTypesData)
+	}
 	opts := map[string]string{
-		"dlp_gcp_credentials": a.getGCPCredentials(),
-		"dlp_info_types":      strings.Join(connParams.DLPInfoTypes, ","),
+		"sid":                       sid,
+		"dlp_provider":              connParams.DlpProvider,
+		"dlp_mode":                  connParams.DlpMode,
+		"mspresidio_analyzer_url":   connParams.DlpPresidioAnalyzerURL,
+		"mspresidio_anonymizer_url": connParams.DlpPresidioAnonymizerURL,
+		"dlp_gcp_credentials":       connParams.DlpGcpRawCredentialsJSON,
+		"dlp_info_types":            strings.Join(connParams.DLPInfoTypes, ","),
+		"data_masking_entity_data":  dataMaskingEntityTypesData,
 	}
 	args := append(connParams.CmdList, connParams.ClientArgs...)
 	cmd, err := libhoop.NewConsole(connParams.EnvVars, args, stdoutWriter, opts)
@@ -95,7 +106,7 @@ func parsePttyWinSize(winSizeBytes []byte) (*pty.Winsize, error) {
 	if len(winSizeSlice) != 4 {
 		return nil, fmt.Errorf("winsize doesn't contain required length (4)")
 	}
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		if _, err := strconv.Atoi(winSizeSlice[i]); err != nil {
 			return nil, fmt.Errorf("failed parsing size (%v), err=%v", i, err)
 		}

@@ -12,8 +12,9 @@
 
 (rf/reg-event-fx
  :navigate
- (fn [_ [_ handler query-params & params]]
-   {:navigate {:handler handler
+ (fn [{:keys [db]} [_ handler query-params & params]]
+   {:db (assoc db :navigation-status :transitioning)
+    :navigate {:handler handler
                :params params
                :query-params (or query-params {})}}))
 
@@ -22,7 +23,9 @@
  ::set-active-panel
  (fn [{:keys [db]} [_ active-panel]]
    (js/window.Intercom "update")
-   {:db (assoc db :active-panel active-panel)}))
+   {:db (-> db
+            (assoc :active-panel active-panel)
+            (assoc :navigation-status :completed))}))
 
 (rf/reg-event-fx
  :fetch
@@ -43,6 +46,14 @@
  (fn
    [{:keys [db]} [_ _]]
    {:db (assoc db :page-loader-status :closed)}))
+
+;; Webclient active panel events
+(rf/reg-event-fx
+ :webclient/set-active-panel
+ (fn [{:keys [db]} [_ panel-type]]
+   (let [current-panel (get db :webclient->active-panel)
+         new-panel (when-not (= current-panel panel-type) panel-type)]
+     {:db (assoc db :webclient->active-panel new-panel)})))
 
 (rf/reg-event-fx
  :close-page-loader
@@ -84,42 +95,31 @@
    {:db (assoc db :dialog-status :closed)}))
 
 (rf/reg-event-fx
- :open-dialog
- (fn [{:keys [db]} [_ data]]
-   {:db (assoc db
-               :dialog-status :open
-               :dialog-on-success (:on-success data)
-               :dialog-text (:text data)
-               :dialog-title (:title data))}))
-
-(rf/reg-event-fx
- :hide-snackbar
- (fn
-   [{:keys [db]} [_ _]]
-   {:db (assoc db
-               :snackbar-status :hidden
-               :snackbar-level nil
-               :snackbar-text nil)}))
-
-(rf/reg-event-fx
- :show-snackbar
- (fn
-   [{:keys [db]} [_ data]]
-   {:db (assoc db
-               :snackbar-status :shown
-               :snackbar-level (:level data)
-               :snackbar-text (:text data))}))
-
-(rf/reg-event-fx
  :initialize-intercom
  (fn
    [{:keys [db]} [_ user]]
-   (js/window.Intercom
-    "boot"
-    (clj->js {:api_base "https://api-iam.intercom.io"
-              :app_id "ryuapdmp"
-              :name (:name user)
-              :email (:email user)
-              :user_id (:email user)
-              :user_hash (:intercom_hmac_digest user)}))
-   {}))
+   (let [analytics-tracking (= "enabled" (get-in db [:gateway->info :data :analytics_tracking] "disabled"))]
+     (when js/window.Intercom
+       (js/window.Intercom "shutdown"))
+
+     (if (not analytics-tracking)
+       ;; If analytics tracking is disabled, don't initialize Intercom
+       {}
+       ;; Otherwise, initialize Intercom
+       (do
+         (if (= (.-hostname js/location) "localhost")
+
+           (js/window.Intercom
+            "boot"
+            (clj->js {:api_base "https://api-iam.intercom.io"
+                      :app_id "ryuapdmp"}))
+
+           (js/window.Intercom
+            "boot"
+            (clj->js {:api_base "https://api-iam.intercom.io"
+                      :app_id "ryuapdmp"
+                      :name (:name user)
+                      :email (:email user)
+                      :user_id (:email user)
+                      :user_hash (:intercom_hmac_digest user)})))
+         {})))))

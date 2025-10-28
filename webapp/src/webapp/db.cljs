@@ -4,12 +4,17 @@
 (def default-db
   {:agents {:status :loading, :data []}
    :agents-embedded []
+   :ai-data-masking {:list {:status :idle :data []}
+                     :active-rule {:status :idle :data nil}
+                     :submitting? false}
    :ask-ai->question-responses []
    :audit->session-details {:status :loading, :session nil, :session-logs {:status :loading}}
+   :audit->session-logs {:status :idle, :data nil}
    :audit->filtered-session-by-id {:status :loading, :data []}
-   :connections {:loading true}
+   :connections {:loading true :details {}}
    :connections->connection-connected {:status :loading, :data nil}
    :connections->updating-connection {:loading true, :data []}
+   :native-client-access {:requesting? false, :current nil}
    :aws-connect {:status :not-started
                  :current-step :credentials
                  :credentials {:type nil
@@ -28,7 +33,8 @@
                       :subtype nil
                       :current-step :type
                       :credentials {}
-                      :tags {}}
+                      :tags {}
+                      :command-args []}
    :database-schema {:status :loading, :schema-tree nil, :indexes-tree nil}
    :dialog {:status :closed
             :type :info
@@ -46,11 +52,6 @@
    :editor-plugin->connections-exec-list {:status :ready :data nil}
    :editor-plugin->connections-runbook-list {:status :ready :data nil}
    :editor-plugin->current-connection {:status :loading :data nil}
-   :editor-plugin->filtered-run-connection-list nil
-   :editor-plugin->run-connection-list {:status :loading :data nil}
-   :editor-plugin->run-connection-list-selected (or (read-string
-                                                     (.getItem js/localStorage "run-connection-list-selected"))
-                                                    nil)
    :editor-plugin->select-language "shell"
    :editor-plugin->script []
    :gateway->info {:loading true, :data nil}
@@ -59,6 +60,7 @@
                                   :description ""
                                   :input [{:type "" :rule "" :details ""}]
                                   :output [{:type "" :rule "" :details ""}]}
+   :guardrails->connections-list {:status :loading :data []}
    :jira-integration->details {:loading true, :data {}}
    :modal-radix {:open? false, :content nil}
    :modal-status :closed
@@ -82,4 +84,13 @@
    :user nil
    :user-groups []
    :users []
-   :users->current-user {:loading true, :data nil}})
+   :users->current-user {:loading true, :data nil}
+   :webclient->active-panel nil
+   :command-palette {:open? false
+                     :query ""
+                     :current-page :main
+                     :context {}
+                     :search-results {:status :idle :data {}}}
+   :runbooks {:connection-dialog-open? false
+              :execute-trigger false
+              :selected-connection nil}})

@@ -12,28 +12,26 @@ import (
 	"strings"
 
 	"github.com/hoophq/hoop/common/envloader"
+
+	idptypes "github.com/hoophq/hoop/gateway/idp/types"
 )
 
 // TODO: it should include all runtime configuration
 
-const (
-	defaultPostgRESTRole             = "hoop_apiuser"
-	defaultWebappStaticUiPath string = "/app/ui/public"
-)
+const defaultWebappStaticUiPath string = "/app/ui/public"
 
 type pgCredentials struct {
 	connectionString string
 	username         string
-	// Postgrest Role Name
-	postgrestRole string
 }
 type Config struct {
 	apiKey                          string
 	askAICredentials                *url.URL
-	authMethod                      string
+	authMethod                      idptypes.ProviderType
 	pgCred                          *pgCredentials
 	gcpDLPJsonCredentials           string
 	dlpProvider                     string
+	dlpMode                         string
 	hasRedactCredentials            bool
 	msPresidioAnalyzerURL           string
 	msPresidioAnonymizerURL         string
@@ -43,7 +41,7 @@ type Config struct {
 	licenseSignerOrgID              string
 	migrationPathFiles              string
 	orgMultitenant                  bool
-	doNotTrack                      bool
+	analyticsTracking               bool
 	apiURL                          string
 	grpcURL                         string
 	apiHostname                     string
@@ -51,7 +49,6 @@ type Config struct {
 	apiScheme                       string
 	apiURLPath                      string
 	webappUsersManagement           string
-	jwtSecretKey                    []byte
 	webappStaticUIPath              string
 	disableSessionsDownload         bool
 	gatewayTLSCa                    string
@@ -78,6 +75,10 @@ func Load() error {
 	if grpcURL == "" {
 		grpcURL = "grpc://127.0.0.1:8010"
 	}
+
+	apiURL = strings.TrimSuffix(apiURL, "/")
+	grpcURL = strings.TrimSuffix(grpcURL, "/")
+
 	apiRawURL, err := url.Parse(apiURL)
 	if err != nil {
 		return fmt.Errorf("failed parsing API_URL env, reason=%v", err)
@@ -89,10 +90,6 @@ func Load() error {
 	pgCred, err := loadPostgresCredentials()
 	if err != nil {
 		return err
-	}
-	pgCred.postgrestRole = os.Getenv("PGREST_ROLE")
-	if pgCred.postgrestRole == "" {
-		pgCred.postgrestRole = defaultPostgRESTRole
 	}
 	migrationPathFiles := strings.TrimSuffix(os.Getenv("MIGRATION_PATH_FILES"), "/")
 	if migrationPathFiles == "" {
@@ -168,6 +165,10 @@ func Load() error {
 			return fmt.Errorf("failed decoding env SSH_CLIENT_HOST_KEY, err=%v", err)
 		}
 	}
+	dlpMode := os.Getenv("DLP_MODE")
+	if dlpMode == "" {
+		dlpMode = "best-effort"
+	}
 
 	runtimeConfig = Config{
 		apiKey:                          os.Getenv("API_KEY"),
@@ -185,15 +186,15 @@ func Load() error {
 		licenseSignerOrgID:              allowedOrgID,
 		gcpDLPJsonCredentials:           gcpJsonCred,
 		orgMultitenant:                  os.Getenv("ORG_MULTI_TENANT") == "true",
-		doNotTrack:                      os.Getenv("DO_NOT_TRACK") == "true",
+		analyticsTracking:               os.Getenv("ANALYTICS_TRACKING") == "enabled",
 		dlpProvider:                     os.Getenv("DLP_PROVIDER"),
+		dlpMode:                         dlpMode,
 		hasRedactCredentials:            hasRedactCredentials,
 		msPresidioAnalyzerURL:           os.Getenv("MSPRESIDIO_ANALYZER_URL"),
 		msPresidioAnonymizerURL:         os.Getenv("MSPRESIDIO_ANONYMIZER_URL"),
 		webhookAppKey:                   os.Getenv("WEBHOOK_APPKEY"),
 		webhookAppURL:                   webhookAppURL,
 		webappUsersManagement:           webappUsersManagement,
-		jwtSecretKey:                    []byte(os.Getenv("JWT_SECRET_KEY")),
 		webappStaticUIPath:              webappStaticUiPath,
 		isLoaded:                        true,
 		disableSessionsDownload:         os.Getenv("DISABLE_SESSIONS_DOWNLOAD") == "true",
@@ -208,36 +209,29 @@ func Load() error {
 
 func Get() Config { return runtimeConfig }
 
-// loadAuthMethod() returns the auth method to use
-// the possible values are: "local" and "idp".
-// If not set, it defaults to "local"
-// it also cross check the IDP_ISSUER, IDP_CLIENT_ID
-// and IDP_CLIENT_SECRET envs to determine if it should
-// the IDP configuration already set even without setting
-// AUTH_METHOD to "idp".
-// This last behavior ensures compatibility with the previous version
-func loadAuthMethod() (authMethod string, err error) {
-	authMethod = os.Getenv("AUTH_METHOD")
-	switch authMethod {
-	case "local":
-		err = validateLocalAuthJwtKey()
-	case "idp":
-	default:
-		if !hasIdpEnvs() {
-			// default to local auth method
-			return "local", validateLocalAuthJwtKey()
+// maintains compatibility by loading oidc auth method when
+// the IDP_ envs are set.
+//
+// Load the local auth method when it's not set
+func loadAuthMethod() (authMethod idptypes.ProviderType, err error) {
+	authMethod = idptypes.ProviderType(os.Getenv("AUTH_METHOD"))
+	if hasIdpEnvs() && authMethod == "" {
+		authMethod = idptypes.ProviderTypeOIDC
+		return
+	}
 
-		}
-		return "idp", nil
+	if authMethod == "" || authMethod == idptypes.ProviderTypeLocal {
+		authMethod = idptypes.ProviderTypeLocal
+	}
+
+	switch authMethod {
+	case idptypes.ProviderTypeOIDC, idptypes.ProviderTypeIDP:
+	case idptypes.ProviderTypeSAML:
+	case idptypes.ProviderTypeLocal, idptypes.ProviderType(""):
+	default:
+		return idptypes.ProviderType(""), fmt.Errorf("invalid AUTH_METHOD env, got=%v", authMethod)
 	}
 	return
-}
-
-func validateLocalAuthJwtKey() error {
-	if jwtSecretKey := os.Getenv("JWT_SECRET_KEY"); jwtSecretKey == "" {
-		return fmt.Errorf("when AUTH_METHOD is set as `local`, you must configure a random string value at the JWT_SECRET_KEY environment variable")
-	}
-	return nil
 }
 
 func hasIdpEnvs() bool {
@@ -249,6 +243,9 @@ func hasIdpEnvs() bool {
 
 func loadPostgresCredentials() (*pgCredentials, error) {
 	pgConnectionURI := os.Getenv("POSTGRES_DB_URI")
+	if pgConnectionURI == "" {
+		pgConnectionURI = "postgres://postgres:postgres@localhost:5432/hoop?sslmode=disable"
+	}
 	pgURL, err := url.Parse(pgConnectionURI)
 	if err != nil {
 		return nil, fmt.Errorf("failed parsing POSTGRES_DB_URI, err=%v", err)
@@ -334,24 +331,23 @@ func (c Config) ApiHost() string                       { return c.apiHost } // A
 func (c Config) ApiScheme() string                     { return c.apiScheme }
 func (c Config) ApiURLPath() string                    { return c.apiURLPath }
 func (c Config) ApiKey() string                        { return c.apiKey }
-func (c Config) AuthMethod() string                    { return c.authMethod }
+func (c Config) AuthMethod() idptypes.ProviderType     { return c.authMethod }
 func (c Config) WebhookAppKey() string                 { return c.webhookAppKey }
 func (c Config) WebhookAppURL() *url.URL               { return c.webhookAppURL }
 func (c Config) GcpDLPJsonCredentials() string         { return c.gcpDLPJsonCredentials }
 func (c Config) DlpProvider() string                   { return c.dlpProvider }
+func (c Config) DlpMode() string                       { return c.dlpMode }
 func (c Config) HasRedactCredentials() bool            { return c.hasRedactCredentials }
 func (c Config) MSPresidioAnalyzerURL() string         { return c.msPresidioAnalyzerURL }
 func (c Config) MSPresidioAnomymizerURL() string       { return c.msPresidioAnonymizerURL }
 func (c Config) PgUsername() string                    { return c.pgCred.username }
 func (c Config) PgURI() string                         { return c.pgCred.connectionString }
-func (c Config) PostgRESTRole() string                 { return c.pgCred.postgrestRole }
-func (c Config) DoNotTrack() bool                      { return c.doNotTrack }
+func (c Config) AnalyticsTracking() bool               { return c.analyticsTracking }
 func (c Config) DisableSessionsDownload() bool         { return c.disableSessionsDownload }
 func (c Config) MigrationPathFiles() string            { return c.migrationPathFiles }
 func (c Config) OrgMultitenant() bool                  { return c.orgMultitenant }
 func (c Config) WebappUsersManagement() string         { return c.webappUsersManagement }
 func (c Config) IsAskAIAvailable() bool                { return c.askAICredentials != nil }
-func (c Config) JWTSecretKey() []byte                  { return c.jwtSecretKey }
 func (c Config) GatewayTLSCa() string                  { return c.gatewayTLSCa }
 func (c Config) GatewayTLSKey() string                 { return c.gatewayTLSKey }
 func (c Config) GatewayTLSCert() string                { return c.gatewayTLSCert }

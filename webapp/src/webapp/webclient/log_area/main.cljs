@@ -3,17 +3,14 @@
             [clojure.string :as cs]
             [re-frame.core :as rf]
             [reagent.core :as r]
-            [webapp.components.data-grid-table :as data-grid-table]
+            [webapp.components.ag-grid-table :as ag-grid-table]
             [webapp.webclient.log-area.output-tabs :refer [tabs]]
             [webapp.webclient.log-area.logs :as logs]))
 
 (defn- transform-results->matrix
   [results connection-type]
-  (let [res (if (= connection-type "oracledb")
-              (cs/join "\n" (drop 1 (cs/split results #"\n")))
-              results)]
-    (when-not (nil? results)
-      (get (js->clj (papa/parse res (clj->js {"delimiter" "\t"}))) "data"))))
+  (when-not (nil? results)
+    (get (js->clj (papa/parse results (clj->js {"delimiter" "\t"}))) "data")))
 
 (def selected-tab (r/atom (or (.getItem js/localStorage "webclient-selected-tab")
                               "Logs")))
@@ -27,7 +24,7 @@
 
 (defn main [_]
   (let [script-response (rf/subscribe [:editor-plugin->script])]
-    (fn [connection-type is-one-connection-selected? show-tabular? dark-mode?]
+    (fn [connection-type is-one-connection-selected? dark-mode?]
       (let [logs-content {:status (:status @script-response)
                           :response (:output (:data @script-response))
                           :response-status (:output_status (:data @script-response))
@@ -41,9 +38,7 @@
             tabular-data (:data @script-response)
             tabular-status (:status @script-response)
             tabular-loading? (= tabular-status :loading)
-            sanitize-results (when-not (nil? (:output tabular-data))
-                               (cs/replace (:output tabular-data) #"∞" "\t"))
-            results-transformed (transform-results->matrix sanitize-results connection-type)
+            results-transformed (transform-results->matrix (:output tabular-data) connection-type)
             results-heads (first results-transformed)
             results-body (next results-transformed)
             connection-type-database? (some (partial = connection-type)
@@ -51,8 +46,7 @@
             available-tabs (merge
                             {:logs "Logs"}
                             (when (and connection-type-database?
-                                       is-one-connection-selected?
-                                       show-tabular?)
+                                       is-one-connection-selected?)
                               {:tabular "Tabular"}))]
 
         (when-not (some #(= @selected-tab %) (vals available-tabs))
@@ -67,6 +61,9 @@
                  :tabs available-tabs
                  :selected-tab @selected-tab}]
           (case @selected-tab
-            "Tabular" [data-grid-table/main results-heads results-body dark-mode? tabular-loading?]
+            "Tabular" [ag-grid-table/main results-heads results-body tabular-loading? dark-mode?
+                       {:height "100%"
+                        :pagination? (> (count results-body) 100)
+                        :auto-size-columns? true}]
             "Logs" [logs/main :logs logs-content]
             :else [logs/main logs-content])]]))))

@@ -22,6 +22,7 @@ common/.idea/*
 .clj-kondo/*
 .lsp/*
 .calva
+.bacon-locations
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
@@ -45,7 +46,11 @@ libhoop
 # misc dev code
 client/cmd/auth
 client/cmd/custom.go
+gateway/cmd/gateway/.env
 
 deploy/docker-compose/hoopdata/terraform/outputs/
 deploy/docker-compose/hoopdata/sessions
 deploy/docker-compose/hoopdata/zitadel-admin-sa.json
+
+**/.claude/settings.local.json
+**/.mcp.json
